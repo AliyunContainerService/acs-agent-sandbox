@@ -1,10 +1,11 @@
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+
+from kubernetes import client, config
 
 from e2b import SandboxException, SandboxNotFoundException
 from e2b_code_interpreter import Sandbox, SandboxState
@@ -44,7 +45,7 @@ parser.add_argument("--agent-name", required=True,
          "(value for security.agents.kruise.io/agent-name annotation)")
 parser.add_argument("--kubeconfig", default="",
     help="Path to kubeconfig file\n"
-         "(default: use kubectl default config)")
+         "(default: use default kubeconfig)")
 parser.add_argument("--timeout", type=int, default=None,
     help="Sandbox timeout in seconds\n"
          "(default: preserve original sandbox timeout policy)")
@@ -75,6 +76,33 @@ RETRY_INTERVAL = 5
 # Pause wait config (seconds)
 PAUSE_WAIT_TIMEOUT = 300
 PAUSE_POLL_INTERVAL = 5
+
+# Kubernetes client constants for Sandbox CRD
+SANDBOX_GROUP = "agents.kruise.io"
+SANDBOX_VERSION = "v1alpha1"
+SANDBOX_PLURAL = "sandboxes"
+
+
+def load_k8s_client(kubeconfig=""):
+    """Load kubeconfig and return a CustomObjectsApi client."""
+    config.load_kube_config(config_file=kubeconfig if kubeconfig else None)
+    return client.CustomObjectsApi()
+
+
+def get_sandbox_cr(api, namespace, name):
+    """
+    Get a Sandbox CR as a dict via the Kubernetes API.
+    Raises RuntimeError on failure.
+    """
+    try:
+        return api.get_namespaced_custom_object(
+            group=SANDBOX_GROUP, version=SANDBOX_VERSION,
+            namespace=namespace, plural=SANDBOX_PLURAL, name=name,
+        )
+    except client.ApiException as e:
+        raise RuntimeError(
+            f"Failed to get sandbox CR {namespace}/{name}: {e.reason} (status {e.status})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -165,28 +193,17 @@ def delete_snapshot(snapshot_id):
 # CSI volume config helpers
 # ---------------------------------------------------------------------------
 
-def fetch_legacy_single_volume_config(kubeconfig, namespace, name):
+def fetch_legacy_single_volume_config(cr):
     """
-    Fetch legacy single-volume CSI annotations (csi-volume-name, csi-mount-point,
-    csi-subpath) from the Sandbox CR and convert to multi-volume config format.
+    Extract legacy single-volume CSI annotations (csi-volume-name, csi-mount-point,
+    csi-subpath) from the given Sandbox CR dict and convert to multi-volume config format.
     Returns a list with a single config dict, or None if csi-volume-name is absent.
     Legacy annotations have no readOnly field, so it defaults to False (read-write).
     """
-    cmd = ["kubectl"]
-    if kubeconfig:
-        cmd += ["--kubeconfig", kubeconfig]
-    cmd += ["get", "sbx", name, "-n", namespace,
-            "-o", "jsonpath={.metadata.annotations['e2b\\.agents\\.kruise\\.io/csi-volume-name']}|{.metadata.annotations['e2b\\.agents\\.kruise\\.io/csi-mount-point']}|{.metadata.annotations['e2b\\.agents\\.kruise\\.io/csi-subpath']}"]
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(f"kubectl get sbx for legacy CSI annotations failed: {result.stderr.strip()}")
-
-    raw = result.stdout.strip()
-    parts = raw.split("|", 2)
-    volume_name = parts[0].strip() if len(parts) > 0 else ""
-    mount_point = parts[1].strip() if len(parts) > 1 else ""
-    sub_path = parts[2].strip() if len(parts) > 2 else ""
+    annotations = cr.get("metadata", {}).get("annotations", {}) or {}
+    volume_name = annotations.get("e2b.agents.kruise.io/csi-volume-name", "")
+    mount_point = annotations.get("e2b.agents.kruise.io/csi-mount-point", "")
+    sub_path = annotations.get("e2b.agents.kruise.io/csi-subpath", "")
 
     if not volume_name:
         return None
@@ -202,28 +219,20 @@ def fetch_legacy_single_volume_config(kubeconfig, namespace, name):
     return [config]
 
 
-def fetch_and_transform_csi_config(kubeconfig, namespace, name, pv_map, cred_rw, cred_ro):
+def fetch_and_transform_csi_config(cr, pv_map, cred_rw, cred_ro):
     """
-    Fetch e2b.agents.kruise.io/csi-volume-config annotation from the Sandbox CR,
+    Extract e2b.agents.kruise.io/csi-volume-config annotation from the given Sandbox CR dict,
     remap PV names, inject credentialProviderName, return modified JSON string.
     If csi-volume-config is absent, falls back to legacy single-volume annotations
     (csi-volume-name, csi-mount-point, csi-subpath) and converts them to multi-volume
     format. Returns None if both are absent.
     """
-    cmd = ["kubectl"]
-    if kubeconfig:
-        cmd += ["--kubeconfig", kubeconfig]
-    cmd += ["get", "sbx", name, "-n", namespace,
-            "-o", "jsonpath={.metadata.annotations['e2b\\.agents\\.kruise\\.io/csi-volume-config']}"]
+    annotations = cr.get("metadata", {}).get("annotations", {}) or {}
+    raw = annotations.get("e2b.agents.kruise.io/csi-volume-config", "")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(f"kubectl get sbx failed: {result.stderr.strip()}")
-
-    raw = result.stdout.strip()
     if not raw:
         print("    No csi-volume-config annotation found on sandbox CR")
-        legacy_configs = fetch_legacy_single_volume_config(kubeconfig, namespace, name)
+        legacy_configs = fetch_legacy_single_volume_config(cr)
         if legacy_configs is None:
             print("    No legacy single-volume annotations found either")
             return None
@@ -250,58 +259,38 @@ def fetch_and_transform_csi_config(kubeconfig, namespace, name, pv_map, cred_rw,
     return json.dumps(configs)
 
 
-def fetch_sandbox_timeout_config(kubeconfig, namespace, name):
+def fetch_sandbox_timeout_config(cr):
     """
-    Fetch spec.shutdownTime and spec.pauseTime from the Sandbox CR via kubectl.
+    Extract spec.shutdownTime and spec.pauseTime from the given Sandbox CR dict.
     Returns (shutdown_time, pause_time) as RFC3339 strings, or None for each if not set.
     """
-    cmd = ["kubectl"]
-    if kubeconfig:
-        cmd += ["--kubeconfig", kubeconfig]
-    cmd += ["get", "sbx", name, "-n", namespace,
-            "-o", "jsonpath={.spec.shutdownTime}|{.spec.pauseTime}"]
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(f"kubectl get sbx for timeout config failed: {result.stderr.strip()}")
-
-    raw = result.stdout.strip()
-    parts = raw.split("|", 1)
-    shutdown_time = parts[0].strip() or None if len(parts) > 0 else None
-    pause_time = parts[1].strip() or None if len(parts) > 1 else None
+    spec = cr.get("spec", {})
+    shutdown_time = spec.get("shutdownTime") or None
+    pause_time = spec.get("pauseTime") or None
     return shutdown_time, pause_time
 
 
-def check_and_fix_dns_policy(kubeconfig, namespace, name):
+def check_and_fix_dns_policy(api, cr, namespace, name):
     """
-    Check sandbox CR's dnsPolicy. If not ClusterFirst, patch it.
+    Check sandbox CR's dnsPolicy from the given CR dict. If not ClusterFirst, patch it.
     No wait — proceed after patching.
     """
-    cmd = ["kubectl"]
-    if kubeconfig:
-        cmd += ["--kubeconfig", kubeconfig]
-    cmd += ["get", "sbx", name, "-n", namespace,
-            "-o", "jsonpath={.spec.template.spec.dnsPolicy}"]
+    current = cr.get("spec", {}).get("template", {}).get("spec", {}).get("dnsPolicy", "")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to get dnsPolicy: {result.stderr.strip()}")
-
-    current = result.stdout.strip()
     if current == "ClusterFirst":
         print(f"    DNS policy is already ClusterFirst")
         return
 
     print(f"    Current dnsPolicy: '{current}', patching to ClusterFirst and clearing upgradePolicy...")
-    patch_cmd = ["kubectl"]
-    if kubeconfig:
-        patch_cmd += ["--kubeconfig", kubeconfig]
-    patch_cmd += ["patch", "sbx", name, "-n", namespace,
-                  "--type=merge",
-                  '-p={"spec":{"template":{"spec":{"dnsPolicy":"ClusterFirst"}},"upgradePolicy":null}}']
-    patch_result = subprocess.run(patch_cmd, capture_output=True, text=True, timeout=30)
-    if patch_result.returncode != 0:
-        raise RuntimeError(f"Failed to patch dnsPolicy: {patch_result.stderr.strip()}")
+    patch = {"spec": {"template": {"spec": {"dnsPolicy": "ClusterFirst"}}, "upgradePolicy": None}}
+    try:
+        api.patch_namespaced_custom_object(
+            group=SANDBOX_GROUP, version=SANDBOX_VERSION,
+            namespace=namespace, plural=SANDBOX_PLURAL, name=name,
+            body=patch,
+        )
+    except client.ApiException as e:
+        raise RuntimeError(f"Failed to patch dnsPolicy: {e.reason} (status {e.status})")
     print(f"    DNS policy patched to ClusterFirst, upgradePolicy cleared")
 
 
@@ -335,7 +324,7 @@ def clone_from_snapshot(snapshot_id, sandbox_id, metadata, timeout=0, auto_pause
     except SandboxException as e:
         err_str = str(e)
         if "409" in err_str:
-            print(f"    Got 409 (old CR still deleting), retrying create...")
+            print(f"    old CR still deleting, waiting...")
             create_deadline = time.time() + RETRY_TIMEOUT
             while time.time() < create_deadline:
                 time.sleep(RETRY_INTERVAL)
@@ -347,7 +336,7 @@ def clone_from_snapshot(snapshot_id, sandbox_id, metadata, timeout=0, auto_pause
                     if "409" in str(retry_err):
                         continue
                     raise
-            raise TimeoutError(f"Sandbox {sandbox_id} still conflicting after {RETRY_TIMEOUT}s")
+            raise TimeoutError(f"Sandbox {sandbox_id} still deleting after {RETRY_TIMEOUT}s")
         elif "504" not in err_str:
             raise
         print(f"    Got ALB 504, sandbox may still be creating on server. Polling...")
@@ -365,16 +354,61 @@ def clone_from_snapshot(snapshot_id, sandbox_id, metadata, timeout=0, auto_pause
                 continue
         raise TimeoutError(f"Sandbox {sandbox_id} not ready after {RETRY_TIMEOUT}s")
 
-# ── Step 1: Connect to the existing sandbox ──
+# ── Step 1: Read and transform CSI volume config ──
 
 sandbox_id = f"{SANDBOX_NAMESPACE}--{SANDBOX_NAME}"
-print(f"[1] Connecting to sandbox: {sandbox_id}")
+
+# Initialize Kubernetes API client
+api = load_k8s_client(args.kubeconfig)
+
+# Pre-check: verify sandbox was created via E2B (has agents.kruise.io/owner annotation)
+try:
+    cr = get_sandbox_cr(api, SANDBOX_NAMESPACE, SANDBOX_NAME)
+except RuntimeError as e:
+    print(f"Error: failed to get sandbox CR: {e}")
+    sys.exit(1)
+annotations = cr.get("metadata", {}).get("annotations", {}) or {}
+if not annotations.get("agents.kruise.io/owner"):
+    print(f"Sandbox {SANDBOX_NAMESPACE}/{SANDBOX_NAME} has no 'agents.kruise.io/owner' annotation, "
+          f"not created via E2B, skipping upgrade")
+    sys.exit(0)
+
+# ── Step 1: Read and transform CSI volume config ──
+
+print(f"[1] Reading CSI volume config from sandbox CR...")
+
+pv_map = parse_pv_map(args.pv_map)
+cred_rw, cred_ro = parse_default_cred(args.default_cred)
+try:
+    csi_config_json = fetch_and_transform_csi_config(
+        cr, pv_map, cred_rw, cred_ro
+    )
+except Exception as e:
+    print(f"    Error: failed to fetch CSI config: {e}")
+    sys.exit(1)
+if csi_config_json:
+    print(f"    Transformed CSI config: {csi_config_json}")
+else:
+    print(f"    No CSI config found on sandbox CR, skip STS upgrade")
+    sys.exit(1)
+
+shutdown_time, pause_time = fetch_sandbox_timeout_config(cr)
+if shutdown_time:
+    print(f"    Original sandbox ShutdownTime: {shutdown_time}")
+else:
+    print(f"    Original sandbox has no ShutdownTime (never-timeout)")
+if pause_time:
+    print(f"    Original sandbox PauseTime: {pause_time}")
+
+# ── Step 2: Connect to the existing sandbox ──
+
+print(f"[2] Connecting to sandbox: {sandbox_id}")
 
 # Check if sandbox is paused before connecting (connect will auto-resume)
 try:
     was_paused = check_sandbox_paused(sandbox_id)
 except Exception as e:
-    print(f"[1] Error: {e}")
+    print(f"[2] Error: {e}")
     sys.exit(1)
 if was_paused:
     print(f"    Original sandbox is paused, will re-pause after upgrade")
@@ -384,45 +418,15 @@ try:
         sandbox_id=sandbox_id,
     )
 except Exception as e:
-    print(f"[1] Failed to connect: {e}")
+    print(f"[2] Failed to connect: {e}")
     raise
 print(f"    Connected. sandbox id: {sbx.sandbox_id}")
-
-# ── Step 2: Read and transform CSI volume config ──
-
-print(f"[2] Reading CSI volume config from sandbox CR...")
-pv_map = parse_pv_map(args.pv_map)
-cred_rw, cred_ro = parse_default_cred(args.default_cred)
-try:
-    csi_config_json = fetch_and_transform_csi_config(
-        args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME, pv_map, cred_rw, cred_ro
-    )
-except Exception as e:
-    print(f"    Error: failed to fetch CSI config: {e}")
-    sys.exit(1)
-if csi_config_json:
-    print(f"    Transformed CSI config: {csi_config_json}")
-else:
-    print(f"    No CSI config found on sandbox CR, cannot proceed with STS upgrade")
-    sys.exit(1)
-
-try:
-    shutdown_time, pause_time = fetch_sandbox_timeout_config(args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME)
-except Exception as e:
-    print(f"    Error: failed to fetch timeout config: {e}")
-    sys.exit(1)
-if shutdown_time:
-    print(f"    Original sandbox ShutdownTime: {shutdown_time}")
-else:
-    print(f"    Original sandbox has no ShutdownTime (never-timeout)")
-if pause_time:
-    print(f"    Original sandbox PauseTime: {pause_time}")
 
 # ── Step 3: Ensure DNS policy is ClusterFirst ──
 
 print(f"[3] Checking DNS policy...")
 try:
-    check_and_fix_dns_policy(args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME)
+    check_and_fix_dns_policy(api, cr, SANDBOX_NAMESPACE, SANDBOX_NAME)
 except Exception as e:
     print(f"    Error: {e}")
     sys.exit(1)
