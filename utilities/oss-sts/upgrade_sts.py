@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 from e2b import SandboxException, SandboxNotFoundException
 from e2b_code_interpreter import Sandbox, SandboxState
@@ -108,14 +109,15 @@ def check_sandbox_paused(sandbox_id):
     """
     Check if sandbox is paused via E2B SDK get_info().
     Returns True if paused, False otherwise.
+    Raises on any error — fail-fast, do not silently return False.
     """
     try:
         info = Sandbox.get_info(
             sandbox_id=sandbox_id,
         )
         return info.state == SandboxState.PAUSED
-    except Exception:
-        return False
+    except Exception as e:
+        raise RuntimeError(f"Failed to check sandbox pause state for {sandbox_id}: {e}")
 
 
 def pause_sandbox(sbx):
@@ -123,17 +125,15 @@ def pause_sandbox(sbx):
     Pause a sandbox via E2B SDK pause()/beta_pause().
     Handles SDK version differences: newer SDKs expose pause(),
     older ones expose beta_pause().
-    Returns True on success, False on failure.
+    Raises on failure — fail-fast.
     """
     try:
         if hasattr(sbx, "pause"):
             sbx.pause()
         else:
             sbx.beta_pause()
-        return True
     except Exception as e:
-        print(f"    Warning: SDK pause failed: {e}")
-        return False
+        raise RuntimeError(f"SDK pause failed: {e}")
 
 
 def wait_for_paused(sandbox_id, timeout, interval):
@@ -147,6 +147,18 @@ def wait_for_paused(sandbox_id, timeout, interval):
             return True
         time.sleep(interval)
     return False
+
+
+def delete_snapshot(snapshot_id):
+    """
+    Delete the intermediate checkpoint/snapshot via E2B SDK.
+    Raises on failure — fail-fast.
+    """
+    deleted = Sandbox.delete_snapshot(snapshot_id=snapshot_id)
+    if deleted:
+        print(f"    Checkpoint deleted: {snapshot_id}")
+    else:
+        print(f"    Checkpoint not found (already deleted): {snapshot_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -167,15 +179,13 @@ def fetch_and_transform_csi_config(kubeconfig, namespace, name, pv_map, cred_rw,
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
-        print(f"    Warning: kubectl get sbx failed: {result.stderr.strip()}")
-        return None
+        raise RuntimeError(f"kubectl get sbx failed: {result.stderr.strip()}")
 
     raw = result.stdout.strip()
     if not raw:
         print("    No csi-volume-config annotation found on sandbox CR")
         return None
-
-    # Normalize smart/curly quotes to straight double quotes for JSON parsing
+    
     try:
         configs = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -197,26 +207,59 @@ def fetch_and_transform_csi_config(kubeconfig, namespace, name, pv_map, cred_rw,
     return json.dumps(configs)
 
 
-def fetch_sandbox_shutdown_time(kubeconfig, namespace, name):
+def fetch_sandbox_timeout_config(kubeconfig, namespace, name):
     """
-    Fetch spec.shutdownTime from the Sandbox CR via kubectl.
-    Returns the RFC3339 time string if set, or None if not set.
+    Fetch spec.shutdownTime and spec.pauseTime from the Sandbox CR via kubectl.
+    Returns (shutdown_time, pause_time) as RFC3339 strings, or None for each if not set.
     """
     cmd = ["kubectl"]
     if kubeconfig:
         cmd += ["--kubeconfig", kubeconfig]
     cmd += ["get", "sbx", name, "-n", namespace,
-            "-o", "jsonpath={.spec.shutdownTime}"]
+            "-o", "jsonpath={.spec.shutdownTime}|{.spec.pauseTime}"]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
-        print(f"    Warning: kubectl get sbx for shutdownTime failed: {result.stderr.strip()}")
-        return None
+        raise RuntimeError(f"kubectl get sbx for timeout config failed: {result.stderr.strip()}")
 
     raw = result.stdout.strip()
-    if not raw:
-        return None
-    return raw
+    parts = raw.split("|", 1)
+    shutdown_time = parts[0].strip() or None if len(parts) > 0 else None
+    pause_time = parts[1].strip() or None if len(parts) > 1 else None
+    return shutdown_time, pause_time
+
+
+def check_and_fix_dns_policy(kubeconfig, namespace, name):
+    """
+    Check sandbox CR's dnsPolicy. If not ClusterFirst, patch it.
+    No wait — proceed after patching.
+    """
+    cmd = ["kubectl"]
+    if kubeconfig:
+        cmd += ["--kubeconfig", kubeconfig]
+    cmd += ["get", "sbx", name, "-n", namespace,
+            "-o", "jsonpath={.spec.template.spec.dnsPolicy}"]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to get dnsPolicy: {result.stderr.strip()}")
+
+    current = result.stdout.strip()
+    if current == "ClusterFirst":
+        print(f"    DNS policy is already ClusterFirst")
+        return
+
+    print(f"    Current dnsPolicy: '{current}', patching to ClusterFirst and clearing upgradePolicy...")
+    patch_cmd = ["kubectl"]
+    if kubeconfig:
+        patch_cmd += ["--kubeconfig", kubeconfig]
+    patch_cmd += ["patch", "sbx", name, "-n", namespace,
+                  "--type=merge",
+                  '-p={"spec":{"template":{"spec":{"dnsPolicy":"ClusterFirst"}},"upgradePolicy":null}}']
+    patch_result = subprocess.run(patch_cmd, capture_output=True, text=True, timeout=30)
+    if patch_result.returncode != 0:
+        raise RuntimeError(f"Failed to patch dnsPolicy: {patch_result.stderr.strip()}")
+    print(f"    DNS policy patched to ClusterFirst, upgradePolicy cleared")
 
 
 # ---------------------------------------------------------------------------
@@ -285,14 +328,17 @@ sandbox_id = f"{SANDBOX_NAMESPACE}--{SANDBOX_NAME}"
 print(f"[1] Connecting to sandbox: {sandbox_id}")
 
 # Check if sandbox is paused before connecting (connect will auto-resume)
-was_paused = check_sandbox_paused(sandbox_id)
+try:
+    was_paused = check_sandbox_paused(sandbox_id)
+except Exception as e:
+    print(f"[1] Error: {e}")
+    sys.exit(1)
 if was_paused:
     print(f"    Original sandbox is paused, will re-pause after upgrade")
 
 try:
     sbx = Sandbox.connect(
         sandbox_id=sandbox_id,
-        timeout=300,
     )
 except Exception as e:
     print(f"[1] Failed to connect: {e}")
@@ -304,24 +350,43 @@ print(f"    Connected. sandbox id: {sbx.sandbox_id}")
 print(f"[2] Reading CSI volume config from sandbox CR...")
 pv_map = parse_pv_map(args.pv_map)
 cred_rw, cred_ro = parse_default_cred(args.default_cred)
-csi_config_json = fetch_and_transform_csi_config(
-    args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME, pv_map, cred_rw, cred_ro
-)
+try:
+    csi_config_json = fetch_and_transform_csi_config(
+        args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME, pv_map, cred_rw, cred_ro
+    )
+except Exception as e:
+    print(f"    Error: failed to fetch CSI config: {e}")
+    sys.exit(1)
 if csi_config_json:
     print(f"    Transformed CSI config: {csi_config_json}")
 else:
     print(f"    No CSI config found on sandbox CR, cannot proceed with STS upgrade")
     sys.exit(1)
 
-shutdown_time = fetch_sandbox_shutdown_time(args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME)
+try:
+    shutdown_time, pause_time = fetch_sandbox_timeout_config(args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME)
+except Exception as e:
+    print(f"    Error: failed to fetch timeout config: {e}")
+    sys.exit(1)
 if shutdown_time:
     print(f"    Original sandbox ShutdownTime: {shutdown_time}")
 else:
     print(f"    Original sandbox has no ShutdownTime (never-timeout)")
+if pause_time:
+    print(f"    Original sandbox PauseTime: {pause_time}")
 
-# ── Step 3: Create a snapshot ──
+# ── Step 3: Ensure DNS policy is ClusterFirst ──
 
-print(f"[3] Creating snapshot...")
+print(f"[3] Checking DNS policy...")
+try:
+    check_and_fix_dns_policy(args.kubeconfig, SANDBOX_NAMESPACE, SANDBOX_NAME)
+except Exception as e:
+    print(f"    Error: {e}")
+    sys.exit(1)
+
+# ── Step 4: Create a snapshot ──
+
+print(f"[4] Creating snapshot...")
 try:
     snapshot_info = sbx.create_snapshot(
         headers={
@@ -330,14 +395,14 @@ try:
         },
     )
 except Exception as e:
-    print(f"[3] Failed to create snapshot: {e}")
+    print(f"[4] Failed to create snapshot: {e}")
     raise
 snapshot_id = snapshot_info.snapshot_id
 print(f"    Snapshot created: {snapshot_id}")
 
-# ── Step 4: Kill the original sandbox and wait for it to be fully gone ──
+# ── Step 5: Kill the original sandbox and wait for it to be fully gone ──
 
-print(f"[4] Killing original sandbox: {sandbox_id}")
+print(f"[5] Killing original sandbox: {sandbox_id}")
 sbx.kill()
 print(f"    Kill request sent, waiting for sandbox to be fully removed...")
 
@@ -351,24 +416,36 @@ while time.time() < deadline:
     except SandboxNotFoundException:
         break
     except Exception:
-        # sandbox may be in 'dead' state which SDK can't parse, treat as gone
-        break
+        # Sandbox may be in 'dead' state which SDK can't parse; keep polling
+        time.sleep(KILL_POLL_INTERVAL)
 else:
     raise TimeoutError(f"Sandbox {sandbox_id} still exists after {KILL_WAIT_TIMEOUT}s")
 
 print(f"    Sandbox fully removed.")
 
-# ── Step 5: Recreate sandbox from snapshot with the same name ──
+# ── Step 6: Recreate sandbox from snapshot with the same name ──
 
-print(f"[5] Creating new sandbox from snapshot '{snapshot_id}' with name '{SANDBOX_NAME}'...")
+print(f"[6] Creating new sandbox from snapshot '{snapshot_id}' with name '{SANDBOX_NAME}'...")
 
-# Determine timeout policy: --timeout overrides; otherwise preserve original
-# When was_paused and pause_after > 0, use auto_pause with pause_after as timeout
-use_auto_pause = was_paused and args.pause_after > 0
+# Determine timeout policy:
+# 1. --pause-after > 0 and was_paused: auto_pause with pause_after (user override)
+# 2. pause_time set: auto_pause with remaining from pause_time (preserve original config)
+# 3. --timeout specified: use that timeout
+# 4. No shutdownTime: never-timeout
+# 5. Else: remaining from shutdownTime
+use_auto_pause = False
 
-if use_auto_pause:
+if was_paused and args.pause_after > 0:
+    use_auto_pause = True
     clone_timeout = args.pause_after
     never_timeout = False
+elif pause_time:
+    use_auto_pause = True
+    pause_dt = datetime.fromisoformat(pause_time.replace("Z", "+00:00"))
+    now_dt = datetime.now(timezone.utc)
+    clone_timeout = max(6000, int((pause_dt - now_dt).total_seconds()))
+    never_timeout = False
+    print(f"    Using auto-pause with remaining timeout: {clone_timeout}s (pauseTime: {pause_time})")
 elif args.timeout is not None:
     clone_timeout = args.timeout
     never_timeout = False
@@ -376,8 +453,16 @@ elif shutdown_time is None:
     clone_timeout = 0
     never_timeout = True
 else:
-    clone_timeout = 0
+    # No --timeout specified, sandbox was running, has shutdownTime.
+    # Use remaining time from original sandbox's shutdownTime.
+    shutdown_dt = datetime.fromisoformat(shutdown_time.replace("Z", "+00:00"))
+    now_dt = datetime.now(timezone.utc)
+    clone_timeout = max(6000, int((shutdown_dt - now_dt).total_seconds()))
     never_timeout = False
+    if clone_timeout > 0:
+        print(f"    Using remaining timeout from original sandbox: {clone_timeout}s (shutdownTime: {shutdown_time})")
+    else:
+        print(f"    Original shutdownTime has passed, using default timeout")
 
 metadata = {
     "e2b.agents.kruise.io/sandbox-name": SANDBOX_NAME,
@@ -392,22 +477,33 @@ new_sbx = clone_from_snapshot(snapshot_id, sandbox_id, metadata,
                               timeout=clone_timeout, auto_pause=use_auto_pause)
 print(f"    Done!")
 
-# ── Step 6: Re-pause if original sandbox was paused ──
+# ── Step 7: Re-pause if original sandbox was paused ──
 
-if was_paused:
-    if use_auto_pause:
-        print(f"[6] Auto-pause enabled (timeout={args.pause_after}s).")
-        print(f"    Sandbox will be auto-paused by server after {args.pause_after}s.")
-        print(f"    No need to wait, upgrade is complete.")
+if use_auto_pause:
+    print(f"[7] Auto-pause enabled, sandbox will be auto-paused by server.")
+    print(f"    No need to wait, upgrade is complete.")
+elif was_paused:
+    print(f"[7] Re-pausing sandbox (original was paused)...")
+    try:
+        pause_sandbox(new_sbx)
+    except Exception as e:
+        print(f"    Failed to pause sandbox: {e}")
+        print(f"    Please manually pause it")
+        sys.exit(1)
+    print(f"    Pause request sent, waiting for sandbox to be paused...")
+    if wait_for_paused(sandbox_id, PAUSE_WAIT_TIMEOUT, PAUSE_POLL_INTERVAL):
+        print(f"    Sandbox paused.")
     else:
-        print(f"[6] Re-pausing sandbox (original was paused)...")
-        if not pause_sandbox(new_sbx):
-            print(f"    Failed to pause sandbox, please manually pause it")
-            sys.exit(1)
-        print(f"    Pause request sent, waiting for sandbox to be paused...")
-        if wait_for_paused(sandbox_id, PAUSE_WAIT_TIMEOUT, PAUSE_POLL_INTERVAL):
-            print(f"    Sandbox paused.")
-        else:
-            print(f"    Timeout waiting for sandbox to pause after {PAUSE_WAIT_TIMEOUT}s")
+        print(f"    Timeout waiting for sandbox to pause after {PAUSE_WAIT_TIMEOUT}s")
+        sys.exit(1)
 else:
-    print(f"[6] Skipping re-pause (original was not paused)")
+    print(f"[7] Skipping re-pause (original was not paused)")
+
+# ── Step 8: Delete intermediate checkpoint ──
+
+print(f"[8] Deleting intermediate checkpoint: {snapshot_id}")
+try:
+    delete_snapshot(snapshot_id)
+except Exception as e:
+    print(f"    Error: failed to delete checkpoint {snapshot_id}: {e}")
+    sys.exit(1)

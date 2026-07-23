@@ -137,15 +137,19 @@ E2B_API_KEY=sk-staging-abc123def456 \
     Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
 [2] Reading CSI volume config from sandbox CR...
     Transformed CSI config: [{"pvName": "oss-sts-pv-1", "mountPath": "/oss-data/sub1", "subPath": "read-01", "readOnly": true, "attributes": {"credentialProviderName": "oss-ro"}}, {"pvName": "oss-sts-pv-2", "mountPath": "/oss-data/sub3", "subPath": "read-write-01", "attributes": {"credentialProviderName": "oss-rw"}}]
-[3] Creating snapshot...
+[3] Checking DNS policy...
+    DNS policy is already ClusterFirst
+[4] Creating snapshot...
     Snapshot created: cp-bp100987kj45vjtbrs0c
-[4] Killing original sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
+[5] Killing original sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
     Kill request sent, waiting for sandbox to be fully removed...
     Sandbox fully removed.
-[5] Creating new sandbox from snapshot 'cp-bp100987kj45vjtbrs0c' with name 'code-interpreter-ossfs-agent-identity-fs86f'...
+[6] Creating new sandbox from snapshot 'cp-bp100987kj45vjtbrs0c' with name 'code-interpreter-ossfs-agent-identity-fs86f'...
     New sandbox created: default--code-interpreter-ossfs-agent-identity-fs86f
     Done!
-[6] Skipping re-pause (original was not paused)
+[7] Skipping re-pause (original was not paused)
+[8] Deleting intermediate checkpoint: cp-bp100987kj45vjtbrs0c
+    Checkpoint deleted: cp-bp100987kj45vjtbrs0c
 ```
 
 **场景 2：原沙箱处于休眠状态**
@@ -157,17 +161,21 @@ E2B_API_KEY=sk-staging-abc123def456 \
     Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
 [2] Reading CSI volume config from sandbox CR...
     Transformed CSI config: [{"pvName": "oss-sts-pv-1", "mountPath": "/oss-data/sub1", "subPath": "read-01", "readOnly": true, "attributes": {"credentialProviderName": "oss-ro"}}]
-[3] Creating snapshot...
+[3] Checking DNS policy...
+    DNS policy is already ClusterFirst
+[4] Creating snapshot...
     Snapshot created: cp-bp100987kj45vjtbrs0c
-[4] Killing original sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
+[5] Killing original sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
     Kill request sent, waiting for sandbox to be fully removed...
     Sandbox fully removed.
-[5] Creating new sandbox from snapshot 'cp-bp100987kj45vjtbrs0c' with name 'code-interpreter-ossfs-agent-identity-fs86f'...
+[6] Creating new sandbox from snapshot 'cp-bp100987kj45vjtbrs0c' with name 'code-interpreter-ossfs-agent-identity-fs86f'...
     New sandbox created: default--code-interpreter-ossfs-agent-identity-fs86f
     Done!
-[6] Re-pausing sandbox (original was paused)...
+[7] Re-pausing sandbox (original was paused)...
     Pause request sent, waiting for sandbox to be paused...
     Sandbox paused.
+[8] Deleting intermediate checkpoint: cp-bp100987kj45vjtbrs0c
+    Checkpoint deleted: cp-bp100987kj45vjtbrs0c
 ```
 
 ### 3.4 失败处理
@@ -178,10 +186,12 @@ E2B_API_KEY=sk-staging-abc123def456 \
 |----------|----------|----------|
 | [1] Connect | sandbox 不存在或域名不可达 | 确认 sandbox 名称和 E2B_DOMAIN |
 | [2] Read CSI Config | kubectl 执行失败或无 CSI 配置 | 确认 kubeconfig 路径；若无 CSI 配置脚本会直接退出 |
-| [3] Snapshot | checkpoint 超时或服务端异常 | 重试，或检查 sandbox-manager 日志 |
-| [4] Kill | sandbox 删除超时 | 手动 `kubectl delete sbx <name> -n <ns>` 后重试 |
-| [5] Recreate | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
-| [6] Re-pause | SDK pause 调用失败或等待超时 | 手动通过 kubectl `patch sbx <name> --type=merge -p '{"spec":{"paused":true}}'` 暂停 |
+| [3] DNS Policy | kubectl get/patch 失败 | 脚本打印警告继续执行；可手动 `kubectl patch sbx <name> -n <ns> --type=merge -p '{"spec":{"template":{"spec":{"dnsPolicy":"ClusterFirst"}}}}'` |
+| [4] Snapshot | checkpoint 超时或服务端异常 | 重试，或检查 sandbox-manager 日志 |
+| [5] Kill | sandbox 删除超时 | 手动 `kubectl delete sbx <name> -n <ns>` 后重试 |
+| [6] Recreate | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
+| [7] Re-pause | SDK pause 调用失败或等待超时 | 手动通过 kubectl `patch sbx <name> --type=merge -p '{"spec":{"paused":true}}'` 暂停 |
+| [8] Delete Checkpoint | SDK `delete_snapshot` 调用失败 | 脚本仅打印警告不中断；可手动调用 `DELETE /templates/{snapshot_id}` 清理 |
 
 ---
 
@@ -201,4 +211,8 @@ E2B_API_KEY=sk-staging-abc123def456 \
 5. **CSI 配置缺失即退出**：若原沙箱无 `csi-volume-config` 注解，脚本在 Step 2 直接退出，不会继续执行快照和克隆。
 
 6. **失败不回滚**：任何步骤失败后该 sandbox 保持当前状态，不会自动恢复。需根据脚本输出中 `[N]` 步骤号定位失败原因，手动处理后重跑。
+
+7. **中途 Checkpoint 自动清理**：升级流程最后一步（Step 8），脚本通过 E2B SDK `Sandbox.delete_snapshot()` 删除快照产生的 Checkpoint。对于需要重新休眠的沙箱，在休眠成功后才删除 Checkpoint。该操作为 best-effort：若删除失败仅打印警告，不影响升级流程。
+
+8. **DNS 策略检查**：创建快照前（Step 3），脚本检查 Sandbox CR 的 `dnsPolicy`，若非 `ClusterFirst` 则自动通过 kubectl patch 修正。该操作不等待 Pod 生效，直接继续后续步骤。
 
