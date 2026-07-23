@@ -141,6 +141,8 @@ E2B_API_KEY=sk-staging-abc123def456 \
     DNS policy is already ClusterFirst
 [4] Creating snapshot...
     Snapshot created: cp-bp100987kj45vjtbrs0c
+    If upgrade fails after this point, restore with:
+    python3 restore_from_cp.py --checkpoint cp-bp100987kj45vjtbrs0c -n default
 [5] Killing original sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
     Kill request sent, waiting for sandbox to be fully removed...
     Sandbox fully removed.
@@ -165,6 +167,8 @@ E2B_API_KEY=sk-staging-abc123def456 \
     DNS policy is already ClusterFirst
 [4] Creating snapshot...
     Snapshot created: cp-bp100987kj45vjtbrs0c
+    If upgrade fails after this point, restore with:
+    python3 restore_from_cp.py --checkpoint cp-bp100987kj45vjtbrs0c -n default --shutdown-time 2026-07-15T10:00:00Z
 [5] Killing original sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
     Kill request sent, waiting for sandbox to be fully removed...
     Sandbox fully removed.
@@ -192,6 +196,109 @@ E2B_API_KEY=sk-staging-abc123def456 \
 | [6] Recreate | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
 | [7] Re-pause | SDK pause 调用失败或等待超时 | 手动通过 kubectl `patch sbx <name> --type=merge -p '{"spec":{"paused":true}}'` 暂停 |
 | [8] Delete Checkpoint | SDK `delete_snapshot` 调用失败 | 脚本仅打印警告不中断；可手动调用 `DELETE /templates/{snapshot_id}` 清理 |
+
+---
+
+## 四、从 Checkpoint 恢复沙箱
+
+当 `upgrade_sts.py` 在创建快照（Step 4）之后的步骤失败时（如 kill、clone、re-pause 等），可以使用已创建的 checkpoint 通过 `restore_from_cp.py` 恢复沙箱。`upgrade_sts.py` 在创建快照后会自动打印恢复命令。
+
+### 4.1 前置条件
+
+- `upgrade_sts.py` 已成功执行到 Step 4（创建快照），输出中包含 `Snapshot created: <checkpoint_id>`
+- 原沙箱已不存在（被 kill 或自然消亡）
+- checkpoint 未被删除（Step 8 未执行或执行失败）
+
+### 4.2 命令格式
+
+```bash
+E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 restore_from_cp.py \
+  --checkpoint <checkpoint_id> \
+  -n <命名空间> \
+  [--kubeconfig <kubeconfig路径>] \
+  [--pause-time <metav1.Time格式>] \
+  [--shutdown-time <metav1.Time格式>]
+```
+
+| 参数 | 位置 | 必传 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| E2B_DOMAIN | 环境变量 | 是 | - | sandbox-manager 域名 |
+| E2B_API_KEY | 环境变量 | 是 | - | E2B API Key |
+| `--checkpoint` | 命令行 | 是 | - | Checkpoint ID（`upgrade_sts.py` 输出的 snapshot_id） |
+| `-n`, `--namespace` | 命令行 | 是 | - | Checkpoint 所在命名空间 |
+| `--kubeconfig` | 命令行 | 否 | 默认kubeconfig | kubeconfig文件路径，用于通过 Kubernetes Python 客户端查询 Checkpoint CR |
+| `--pause-time` | 命令行 | 否 | - | 绝对暂停时间，metav1.Time 格式（如 `2026-07-23T16:07:44Z`）。设置后沙箱将在该时间自动暂停 |
+| `--shutdown-time` | 命令行 | 否 | - | 绝对关闭时间，metav1.Time 格式（如 `2026-07-23T16:07:44Z`）。设置后沙箱将在该时间自动关闭 |
+
+> `--pause-time` 和 `--shutdown-time` 互斥，不能同时指定。若都不指定，则设为 never-timeout。
+
+### 4.3 执行示例
+
+```bash
+# 示例 1：使用 upgrade_sts.py 输出的恢复命令（never-timeout 沙箱）
+E2B_DOMAIN=e2b-staging.example.com \
+E2B_API_KEY=sk-staging-abc123def456 \
+/opt/venv/bin/python3 restore_from_cp.py \
+  --checkpoint cp-bp100987kj45vjtbrs0c \
+  -n default
+
+# 示例 2：指定 pauseTime（原沙箱有 pauseTime）
+E2B_DOMAIN=e2b-staging.example.com \
+E2B_API_KEY=sk-staging-abc123def456 \
+/opt/venv/bin/python3 restore_from_cp.py \
+  --checkpoint cp-bp100987kj45vjtbrs0c \
+  -n default \
+  --pause-time 2026-07-23T16:07:44Z
+
+# 示例 3：指定 shutdownTime（原沙箱有 shutdownTime 但无 pauseTime）
+E2B_DOMAIN=e2b-staging.example.com \
+E2B_API_KEY=sk-staging-abc123def456 \
+/opt/venv/bin/python3 restore_from_cp.py \
+  --checkpoint cp-bp100987kj45vjtbrs0c \
+  -n default \
+  --shutdown-time 2026-07-25T10:00:00Z
+```
+
+### 4.4 预期输出
+
+**场景 1：沙箱不存在，从 checkpoint 恢复**
+
+```
+[1] Looking up checkpoint: cp-bp100987kj45vjtbrs0c in namespace default
+    Found checkpoint: sandbox_name=code-interpreter-ossfs-agent-identity-fs86f
+[2] Checking if sandbox already exists: default--code-interpreter-ossfs-agent-identity-fs86f
+    Sandbox not found, proceeding to restore.
+[3] Cloning sandbox from checkpoint 'cp-bp100987kj45vjtbrs0c' with name 'code-interpreter-ossfs-agent-identity-fs86f'...
+    Using never-timeout
+    New sandbox created: default--code-interpreter-ossfs-agent-identity-fs86f
+    Done!
+```
+
+**场景 2：沙箱已存在，直接退出**
+
+```
+[1] Looking up checkpoint: cp-bp100987kj45vjtbrs0c in namespace default
+    Found checkpoint: sandbox_name=code-interpreter-ossfs-agent-identity-fs86f
+[2] Checking if sandbox already exists: default--code-interpreter-ossfs-agent-identity-fs86f
+    Sandbox already exists (state: SandboxState.RUNNING), nothing to do.
+```
+
+### 4.5 脚本流程
+
+1. **Step 1**: 通过 Kubernetes API 查询 Checkpoint CR，根据 `status.checkpointId` 匹配，获取 `spec.podName` 作为沙箱名称
+2. **Step 2**: 通过 E2B SDK `get_info()` 检查沙箱是否已存在
+   - 若沙箱处于 Running/Paused 状态：直接退出（无需恢复）
+   - 若沙箱处于 dead 等不可读状态：报错退出（需手动清理）
+   - 若沙箱不存在（SandboxNotFoundException）：继续恢复
+3. **Step 3**: 从 checkpoint 克隆新沙箱，根据 `--pause-time`/`--shutdown-time` 设置超时策略
+
+### 4.6 失败处理
+
+| 失败步骤 | 可能原因 | 处理方式 |
+|----------|----------|----------|
+| [1] Lookup Checkpoint | Checkpoint CR 不存在或 Kubernetes API 调用失败 | 确认 checkpoint ID 和命名空间；检查 kubeconfig 路径 |
+| [2] Check Sandbox | 沙箱处于 dead 状态 | 手动 `kubectl delete sbx <name> -n <ns>` 后重试 |
+| [3] Clone | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
 
 ---
 

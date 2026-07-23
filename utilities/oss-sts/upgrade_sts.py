@@ -451,6 +451,15 @@ except Exception as e:
 snapshot_id = snapshot_info.snapshot_id
 print(f"    Snapshot created: {snapshot_id}")
 
+# Print restore command for recovery if subsequent steps fail
+restore_cmd = f"python3 restore_from_cp.py --checkpoint {snapshot_id} -n {SANDBOX_NAMESPACE}"
+if pause_time:
+    restore_cmd += f" --pause-time {pause_time}"
+elif shutdown_time:
+    restore_cmd += f" --shutdown-time {shutdown_time}"
+print(f"    If upgrade fails after this point, restore with:")
+print(f"    {restore_cmd}")
+
 # ── Step 5: Kill the original sandbox and wait for it to be fully gone ──
 
 print(f"[5] Killing original sandbox: {sandbox_id}")
