@@ -8,22 +8,22 @@
 
 ### 2.1 环境
 
-- Python 3.8+，已安装 `e2b` 和 `e2b_code_interpreter` SDK
-- kubectl 可访问目标集群
+- Python 3.8+，已安装 `e2b`、`e2b_code_interpreter` SDK 和 `kubernetes` Python 包（`pip install kubernetes`）
+- kubeconfig 可访问目标集群
 - sandbox-manager 已部署，域名可 DNS 解析
 
 ### 2.2 需要准备的信息
 
-| 参数 | 说明 | 示例                                                      |
-|------|------|---------------------------------------------------------|
-| kubeconfig | 集群认证文件路径 | `/path/to/kubeconfig`                                   |
-| E2B_DOMAIN | sandbox-manager 域名 | `e2b-staging.example.com`                               |
-| E2B_API_KEY | E2B API Key | `sk-staging-abc123def456`                               |
-| Python 路径 | 安装了 e2b SDK 的 Python 解释器 | `/opt/venv/bin/python3`                                 |
-| 脚本目录 | upgrade_sts.py 所在目录 | `/path/to/sbx/`                                         |
-| OSS 新老PV 的映射 | 对每个原来使用AKSK方式挂载的PV， 说明对应的使用STS的PV | `oss-aksk-pv-1:oss-sts-pv-1;oss-aksk-pv-2:oss-sts-pv-2` |
+| 参数 | 说明                                                        | 示例                                                      |
+|------|-----------------------------------------------------------|---------------------------------------------------------|
+| kubeconfig | 集群认证文件路径                                                  | `/path/to/kubeconfig`                                   |
+| E2B_DOMAIN | sandbox-manager 域名                                        | `e2b-staging.example.com`                               |
+| E2B_API_KEY | E2B API Key, 需要和创建sandbox使用相同的KEY                         | `sk-staging-abc123def456`                               |
+| Python 路径 | 安装了 e2b SDK 和 kubernetes 包的 Python 解释器                    | `/opt/venv/bin/python3`                                 |
+| 脚本目录 | upgrade_sts.py 所在目录                                       | `/path/to/sbx/`                                         |
+| OSS 新老PV 的映射 | 对每个原来使用AKSK方式挂载的PV， 说明对应的使用STS的PV                         | `oss-aksk-pv-1:oss-sts-pv-1;oss-aksk-pv-2:oss-sts-pv-2` |
 | 默认的CredientalProvider | 用于配置PV挂载所需要的CredientalProvider 名， 读写和只读用`:`分割， 只读可省略默认同读写 | `oss-rw:oss-ro` 或 `oss-rw`                              | 
-| Agent应用名 | 沙箱运行的agent的应用名 | `openclaw`                                              |
+| Agent应用名 | 沙箱运行的agent的应用名                                            | `openclaw`                                              |
 
 ### 2.3 需要准备的信息
 
@@ -87,7 +87,7 @@ E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 upgrade_sts.py \
 | `--pv-map` | 命令行 | 是 | - | 新老PV映射，格式 `oss-aksk-pv-1:oss-sts-pv-1;oss-aksk-pv-2:oss-sts-pv-2`                      |
 | `--default-cred` | 命令行 | 是 | - | 默认CredentialProvider名，格式 `oss-rw` 或 `oss-rw:oss-ro`；省略ro时默认同rw |
 | `--agent-name` | 命令行 | 是 | - | Agent应用名，写入 `security.agents.kruise.io/agent-name` annotation  |
-| `--kubeconfig` | 命令行 | 否 | kubectl默认 | kubeconfig文件路径，用于通过kubectl读取沙箱的CSI挂载配置                         |
+| `--kubeconfig` | 命令行 | 否 | 默认kubeconfig | kubeconfig文件路径，用于通过 Kubernetes Python 客户端读取沙箱的CSI挂载配置                       |
 | `--timeout` | 命令行 | 否 | 保留原策略 | 沙箱超时时间（秒）；不指定时自动保留原沙箱策略：原沙箱无 ShutdownTime 则设为 never-timeout |
 | `--pause-after` | 命令行 | 否 | `0` | 升级后自动暂停超时秒数；仅原沙箱休眠时生效。0 表示立即通过 SDK 暂停；N > 0 时创建时设置 `lifecycle={'on_timeout':'pause'}`，服务端 N 秒后自动暂停 |
 
@@ -132,11 +132,11 @@ E2B_API_KEY=sk-staging-abc123def456 \
 **场景 1：原沙箱非休眠状态**
 
 ```
-[1] Connecting to sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
+[1] Reading CSI volume config from sandbox CR...
     Original sandbox has no ShutdownTime (never-timeout)
-    Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
-[2] Reading CSI volume config from sandbox CR...
     Transformed CSI config: [{"pvName": "oss-sts-pv-1", "mountPath": "/oss-data/sub1", "subPath": "read-01", "readOnly": true, "attributes": {"credentialProviderName": "oss-ro"}}, {"pvName": "oss-sts-pv-2", "mountPath": "/oss-data/sub3", "subPath": "read-write-01", "attributes": {"credentialProviderName": "oss-rw"}}]
+[2] Connecting to sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
+    Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
 [3] Checking DNS policy...
     DNS policy is already ClusterFirst
 [4] Creating snapshot...
@@ -155,12 +155,12 @@ E2B_API_KEY=sk-staging-abc123def456 \
 **场景 2：原沙箱处于休眠状态**
 
 ```
-[1] Connecting to sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
-    Original sandbox is paused, will re-pause after upgrade
+[1] Reading CSI volume config from sandbox CR...
     Original sandbox ShutdownTime: 2026-07-15T10:00:00Z
-    Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
-[2] Reading CSI volume config from sandbox CR...
     Transformed CSI config: [{"pvName": "oss-sts-pv-1", "mountPath": "/oss-data/sub1", "subPath": "read-01", "readOnly": true, "attributes": {"credentialProviderName": "oss-ro"}}]
+[2] Connecting to sandbox: default--code-interpreter-ossfs-agent-identity-fs86f
+    Original sandbox is paused, will re-pause after upgrade
+    Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
 [3] Checking DNS policy...
     DNS policy is already ClusterFirst
 [4] Creating snapshot...
@@ -184,9 +184,9 @@ E2B_API_KEY=sk-staging-abc123def456 \
 
 | 失败步骤 | 可能原因 | 处理方式 |
 |----------|----------|----------|
-| [1] Connect | sandbox 不存在或域名不可达 | 确认 sandbox 名称和 E2B_DOMAIN |
-| [2] Read CSI Config | kubectl 执行失败或无 CSI 配置 | 确认 kubeconfig 路径；若无 CSI 配置脚本会直接退出 |
-| [3] DNS Policy | kubectl get/patch 失败 | 脚本打印警告继续执行；可手动 `kubectl patch sbx <name> -n <ns> --type=merge -p '{"spec":{"template":{"spec":{"dnsPolicy":"ClusterFirst"}}}}'` |
+| [1] Read CSI Config | Kubernetes API 调用失败或无 CSI 配置 | 确认 kubeconfig 路径；若无 CSI 配置脚本会直接退出 |
+| [2] Connect | sandbox 不存在或域名不可达 | 确认 sandbox 名称和 E2B_DOMAIN |
+| [3] DNS Policy | Kubernetes API get/patch 失败 | 脚本打印警告继续执行；可手动 `kubectl patch sbx <name> -n <ns> --type=merge -p '{"spec":{"template":{"spec":{"dnsPolicy":"ClusterFirst"}}}}'` |
 | [4] Snapshot | checkpoint 超时或服务端异常 | 重试，或检查 sandbox-manager 日志 |
 | [5] Kill | sandbox 删除超时 | 手动 `kubectl delete sbx <name> -n <ns>` 后重试 |
 | [6] Recreate | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
@@ -199,20 +199,20 @@ E2B_API_KEY=sk-staging-abc123def456 \
 
 1. **sandbox 升级后标签会变**：快照重建后 `sandbox-template` 标签会带 hash 后缀，`sandbox-pool` 标签可能丢失。
 
-2. **E2B SDK 依赖**：执行脚本的 Python 解释器必须已安装 `e2b` 和 `e2b_code_interpreter` 包，建议使用虚拟环境路径。
+2. **Python 依赖**：执行脚本的 Python 解释器必须已安装 `e2b`、`e2b_code_interpreter` 和 `kubernetes` 包，建议使用虚拟环境路径。`kubernetes` 包可通过 `pip install kubernetes` 安装。
 
 3. **超时策略保留**：不指定 `--timeout` 时，脚本自动检测原沙箱的 ShutdownTime。若原沙箱无 ShutdownTime（never-timeout），新沙箱也设为 never-timeout；否则使用默认超时。指定 `--timeout` 则覆盖原策略。
 
-4. **休眠状态感知**：脚本在连接前通过 E2B SDK `get_info()` 检测原沙箱是否处于休眠状态。若原沙箱休眠中：
+4. **休眠状态感知**：脚本在连接沙箱前（Step 2）通过 E2B SDK `get_info()` 检测原沙箱是否处于休眠状态。若原沙箱休眠中：
    - `--pause-after 0`（默认）：升级完成后立即通过 SDK `pause()` 暂停新沙箱
    - `--pause-after N`（N > 0）：创建时传入 `lifecycle={'on_timeout': 'pause'}` 和 `timeout=N`，由服务端在 N 秒后自动暂停
    - 若原沙箱非休眠状态，跳过此步骤
 
-5. **CSI 配置缺失即退出**：若原沙箱无 `csi-volume-config` 注解，脚本在 Step 2 直接退出，不会继续执行快照和克隆。
+5. **CSI 配置自动转换**：脚本优先读取 `csi-volume-config` 注解（多卷挂载格式）。若该注解不存在，脚本会回退检查旧版单卷挂载注解（`csi-volume-name`、`csi-mount-point`、`csi-subpath`），并自动转换为多卷挂载格式（`readOnly` 默认为 `false`，即读写挂载，因为旧版注解无 `readOnly` 字段）。若两种格式均不存在，脚本在 Step 1 直接退出，不会连接沙箱。在 `prepare_fix_sts.py` 中，转换后还会自动清除旧版单卷注解。
 
 6. **失败不回滚**：任何步骤失败后该 sandbox 保持当前状态，不会自动恢复。需根据脚本输出中 `[N]` 步骤号定位失败原因，手动处理后重跑。
 
 7. **中途 Checkpoint 自动清理**：升级流程最后一步（Step 8），脚本通过 E2B SDK `Sandbox.delete_snapshot()` 删除快照产生的 Checkpoint。对于需要重新休眠的沙箱，在休眠成功后才删除 Checkpoint。该操作为 best-effort：若删除失败仅打印警告，不影响升级流程。
 
-8. **DNS 策略检查**：创建快照前（Step 3），脚本检查 Sandbox CR 的 `dnsPolicy`，若非 `ClusterFirst` 则自动通过 kubectl patch 修正。该操作不等待 Pod 生效，直接继续后续步骤。
+8. **DNS 策略检查**：创建快照前（Step 3），脚本检查 Sandbox CR 的 `dnsPolicy`，若非 `ClusterFirst` 则自动通过 Kubernetes API patch 修正。该操作不等待 Pod 生效，直接继续后续步骤。
 
