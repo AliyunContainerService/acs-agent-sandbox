@@ -165,11 +165,50 @@ def delete_snapshot(snapshot_id):
 # CSI volume config helpers
 # ---------------------------------------------------------------------------
 
+def fetch_legacy_single_volume_config(kubeconfig, namespace, name):
+    """
+    Fetch legacy single-volume CSI annotations (csi-volume-name, csi-mount-point,
+    csi-subpath) from the Sandbox CR and convert to multi-volume config format.
+    Returns a list with a single config dict, or None if csi-volume-name is absent.
+    Legacy annotations have no readOnly field, so it defaults to False (read-write).
+    """
+    cmd = ["kubectl"]
+    if kubeconfig:
+        cmd += ["--kubeconfig", kubeconfig]
+    cmd += ["get", "sbx", name, "-n", namespace,
+            "-o", "jsonpath={.metadata.annotations['e2b\\.agents\\.kruise\\.io/csi-volume-name']}|{.metadata.annotations['e2b\\.agents\\.kruise\\.io/csi-mount-point']}|{.metadata.annotations['e2b\\.agents\\.kruise\\.io/csi-subpath']}"]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"kubectl get sbx for legacy CSI annotations failed: {result.stderr.strip()}")
+
+    raw = result.stdout.strip()
+    parts = raw.split("|", 2)
+    volume_name = parts[0].strip() if len(parts) > 0 else ""
+    mount_point = parts[1].strip() if len(parts) > 1 else ""
+    sub_path = parts[2].strip() if len(parts) > 2 else ""
+
+    if not volume_name:
+        return None
+
+    print(f"    Found legacy single-volume annotations, converting to multi-volume format")
+    print(f"    csi-volume-name: {volume_name}, csi-mount-point: {mount_point}, csi-subpath: {sub_path}")
+
+    config = {"pvName": volume_name, "readOnly": False}
+    if mount_point:
+        config["mountPath"] = mount_point
+    if sub_path:
+        config["subPath"] = sub_path
+    return [config]
+
+
 def fetch_and_transform_csi_config(kubeconfig, namespace, name, pv_map, cred_rw, cred_ro):
     """
     Fetch e2b.agents.kruise.io/csi-volume-config annotation from the Sandbox CR,
     remap PV names, inject credentialProviderName, return modified JSON string.
-    Returns None if annotation is absent.
+    If csi-volume-config is absent, falls back to legacy single-volume annotations
+    (csi-volume-name, csi-mount-point, csi-subpath) and converts them to multi-volume
+    format. Returns None if both are absent.
     """
     cmd = ["kubectl"]
     if kubeconfig:
@@ -184,14 +223,18 @@ def fetch_and_transform_csi_config(kubeconfig, namespace, name, pv_map, cred_rw,
     raw = result.stdout.strip()
     if not raw:
         print("    No csi-volume-config annotation found on sandbox CR")
-        return None
-    
-    try:
-        configs = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"    Failed to parse csi-volume-config annotation as JSON: {e}")
-        print(f"    Raw value: {raw}")
-        raise
+        legacy_configs = fetch_legacy_single_volume_config(kubeconfig, namespace, name)
+        if legacy_configs is None:
+            print("    No legacy single-volume annotations found either")
+            return None
+        configs = legacy_configs
+    else:
+        try:
+            configs = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"    Failed to parse csi-volume-config annotation as JSON: {e}")
+            print(f"    Raw value: {raw}")
+            raise
     for cfg in configs:
         old_pv = cfg.get("pvName", "")
         if old_pv in pv_map:
@@ -385,6 +428,10 @@ except Exception as e:
     sys.exit(1)
 
 # ── Step 4: Create a snapshot ──
+
+# Wait for DNS policy patch to take effect before snapshotting
+print(f"    Waiting 5s for DNS policy to take effect...")
+time.sleep(5)
 
 print(f"[4] Creating snapshot...")
 try:
