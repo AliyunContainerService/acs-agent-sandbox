@@ -105,6 +105,49 @@ def find_checkpoint_cr(api, namespace, checkpoint_id):
     return None
 
 
+def get_sandbox_cr(api, namespace, name):
+    """Get a Sandbox CR as a dict. Returns None if not found."""
+    try:
+        return api.get_namespaced_custom_object(
+            group=SANDBOX_GROUP, version=SANDBOX_VERSION,
+            namespace=namespace, plural=SANDBOX_PLURAL, name=name,
+        )
+    except client.ApiException as e:
+        if e.status == 404:
+            return None
+        raise RuntimeError(
+            f"Failed to get sandbox CR {namespace}/{name}: {e.reason} (status {e.status})"
+        )
+
+
+def delete_sandbox_cr_and_wait(api, namespace, name, timeout, interval):
+    """Delete a Sandbox CR and wait until it is fully removed from the API server."""
+    try:
+        api.delete_namespaced_custom_object(
+            group=SANDBOX_GROUP, version=SANDBOX_VERSION,
+            namespace=namespace, plural=SANDBOX_PLURAL, name=name,
+        )
+    except client.ApiException as e:
+        if e.status == 404:
+            return  # Already gone
+        raise RuntimeError(
+            f"Failed to delete sandbox CR {namespace}/{name}: {e.reason} (status {e.status})"
+        )
+
+    print(f"    Waiting for sandbox CR to be fully removed...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(interval)
+        if get_sandbox_cr(api, namespace, name) is None:
+            return
+    raise TimeoutError(f"Sandbox CR {namespace}/{name} still exists after {timeout}s")
+
+
+# Sandbox deletion wait config (seconds)
+DELETE_WAIT_TIMEOUT = 120
+DELETE_POLL_INTERVAL = 3
+
+
 # ---------------------------------------------------------------------------
 # Clone helper (duplicated from upgrade_sts.py)
 # ---------------------------------------------------------------------------
@@ -182,6 +225,12 @@ if checkpoint_cr is None:
     print(f"[1] Error: Checkpoint {args.checkpoint} not found in namespace {args.namespace}")
     sys.exit(1)
 
+checkpoint_phase = checkpoint_cr.get("status", {}).get("phase", "")
+if checkpoint_phase != "Succeeded":
+    print(f"[1] Error: Checkpoint {args.checkpoint} phase is '{checkpoint_phase}', expected 'Succeeded'")
+    sys.exit(1)
+print(f"    Checkpoint phase: Succeeded")
+
 sandbox_name = checkpoint_cr.get("spec", {}).get("podName")
 if not sandbox_name:
     print(f"[1] Error: Checkpoint {args.checkpoint} has no spec.podName")
@@ -189,6 +238,28 @@ if not sandbox_name:
 
 sandbox_id = f"{args.namespace}--{sandbox_name}"
 print(f"    Found checkpoint: sandbox_name={sandbox_name}")
+
+# Check sandbox CR phase — if Failed, delete and wait for removal
+try:
+    sbx_cr = get_sandbox_cr(api, args.namespace, sandbox_name)
+except RuntimeError as e:
+    print(f"[1] Error: {e}")
+    sys.exit(1)
+
+if sbx_cr is not None:
+    sbx_phase = sbx_cr.get("status", {}).get("phase", "")
+    if sbx_phase == "Failed":
+        print(f"    Sandbox CR phase is Failed, deleting...")
+        try:
+            delete_sandbox_cr_and_wait(api, args.namespace, sandbox_name,
+                                       DELETE_WAIT_TIMEOUT, DELETE_POLL_INTERVAL)
+        except (RuntimeError, TimeoutError) as e:
+            print(f"[1] Error: {e}")
+            sys.exit(1)
+        print(f"    Sandbox CR removed.")
+    elif sbx_phase in ("Running", "Paused"):
+        print(f"    Sandbox CR phase is {sbx_phase}, sandbox already exists, nothing to do.")
+        sys.exit(0)
 
 # ── Step 2: Check if sandbox already exists ──
 
