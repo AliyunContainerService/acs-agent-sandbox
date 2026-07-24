@@ -75,7 +75,7 @@ E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 upgrade_sts.py \
   --agent-name <Agent应用名> \
   [--kubeconfig <kubeconfig路径>] \
   [--timeout <超时秒数>] \
-  [--pause-after <延迟暂停秒数>]
+  [--gc-checkpoint]
 ```
 
 | 参数 | 位置 | 必传 | 默认值 | 说明                                                             |
@@ -88,8 +88,8 @@ E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 upgrade_sts.py \
 | `--default-cred` | 命令行 | 是 | - | 默认CredentialProvider名，格式 `oss-rw` 或 `oss-rw:oss-ro`；省略ro时默认同rw |
 | `--agent-name` | 命令行 | 是 | - | Agent应用名，写入 `security.agents.kruise.io/agent-name` annotation  |
 | `--kubeconfig` | 命令行 | 否 | 默认kubeconfig | kubeconfig文件路径，用于通过 Kubernetes Python 客户端读取沙箱的CSI挂载配置                       |
-| `--timeout` | 命令行 | 否 | 保留原策略 | 沙箱超时时间（秒）；不指定时自动保留原沙箱策略：原沙箱无 ShutdownTime 则设为 never-timeout |
-| `--pause-after` | 命令行 | 否 | `0` | 升级后自动暂停超时秒数；仅原沙箱休眠时生效。0 表示立即通过 SDK 暂停；N > 0 时创建时设置 `lifecycle={'on_timeout':'pause'}`，服务端 N 秒后自动暂停 |
+| `--timeout` | 命令行 | 否 | 保留原策略 | 沙箱超时时间（秒）；不指定时自动保留原沙箱策略：有 pauseTime 则按 pauseTime 剩余时间设为 auto-pause，有 shutdownTime 则按剩余时间设为超时，均无则设为 never-timeout |
+| `--gc-checkpoint` | 命令行 | 否 | `false` | 是否在升级完成后删除中间 checkpoint。不指定时保留 checkpoint 以备手动恢复；指定后执行 Step 8 删除 |
 
 ### 3.2 执行示例
 
@@ -116,7 +116,7 @@ E2B_API_KEY=sk-staging-abc123def456 \
   --agent-name openclaw \
   --timeout 300
 
-# 示例 3：原沙箱休眠中，升级后等待60秒再暂停
+# 示例 3：升级后自动清理 checkpoint
 E2B_DOMAIN=e2b-staging.example.com \
 E2B_API_KEY=sk-staging-abc123def456 \
 /opt/venv/bin/python3 upgrade_sts.py \
@@ -124,7 +124,7 @@ E2B_API_KEY=sk-staging-abc123def456 \
   --pv-map oss-aksk-pv-1:oss-sts-pv-1 \
   --default-cred oss-rw:oss-ro \
   --agent-name openclaw \
-  --pause-after 60
+  --gc-checkpoint
 ```
 
 ### 3.3 预期输出
@@ -150,8 +150,7 @@ E2B_API_KEY=sk-staging-abc123def456 \
     New sandbox created: default--code-interpreter-ossfs-agent-identity-fs86f
     Done!
 [7] Skipping re-pause (original was not paused)
-[8] Deleting intermediate checkpoint: cp-bp100987kj45vjtbrs0c
-    Checkpoint deleted: cp-bp100987kj45vjtbrs0c
+[8] Skipping checkpoint deletion (--gc-checkpoint not set): cp-bp100987kj45vjtbrs0c
 ```
 
 **场景 2：原沙箱处于休眠状态**
@@ -178,8 +177,7 @@ E2B_API_KEY=sk-staging-abc123def456 \
 [7] Re-pausing sandbox (original was paused)...
     Pause request sent, waiting for sandbox to be paused...
     Sandbox paused.
-[8] Deleting intermediate checkpoint: cp-bp100987kj45vjtbrs0c
-    Checkpoint deleted: cp-bp100987kj45vjtbrs0c
+[8] Skipping checkpoint deletion (--gc-checkpoint not set): cp-bp100987kj45vjtbrs0c
 ```
 
 ### 3.4 失败处理
@@ -195,7 +193,7 @@ E2B_API_KEY=sk-staging-abc123def456 \
 | [5] Kill | sandbox 删除超时 | 手动 `kubectl delete sbx <name> -n <ns>` 后重试 |
 | [6] Recreate | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
 | [7] Re-pause | SDK pause 调用失败或等待超时 | 手动通过 kubectl `patch sbx <name> --type=merge -p '{"spec":{"paused":true}}'` 暂停 |
-| [8] Delete Checkpoint | SDK `delete_snapshot` 调用失败 | 脚本仅打印警告不中断；可手动调用 `DELETE /templates/{snapshot_id}` 清理 |
+| [8] Delete Checkpoint | SDK `delete_snapshot` 调用失败 | 仅在指定 `--gc-checkpoint` 时执行；失败时打印错误并退出，可手动调用 `DELETE /templates/{snapshot_id}` 清理 |
 
 ---
 
@@ -308,18 +306,19 @@ E2B_API_KEY=sk-staging-abc123def456 \
 
 2. **Python 依赖**：执行脚本的 Python 解释器必须已安装 `e2b`、`e2b_code_interpreter` 和 `kubernetes` 包，建议使用虚拟环境路径。`kubernetes` 包可通过 `pip install kubernetes` 安装。
 
-3. **超时策略保留**：不指定 `--timeout` 时，脚本自动检测原沙箱的 ShutdownTime。若原沙箱无 ShutdownTime（never-timeout），新沙箱也设为 never-timeout；否则使用默认超时。指定 `--timeout` 则覆盖原策略。
+3. **超时策略保留**：不指定 `--timeout` 时，脚本自动检测原沙箱的 pauseTime 和 ShutdownTime：
+   - 有 pauseTime：设为 auto-pause，超时时间为 pauseTime 剩余时间（最少 600 秒），服务端超时后自动暂停
+   - 有 ShutdownTime：按 ShutdownTime 剩余时间设为超时（最少 600 秒）
+   - 均无：设为 never-timeout
+   指定 `--timeout` 则覆盖上述策略。当原沙箱有 pauseTime 时，`--timeout` 仅覆盖超时秒数，auto-pause 行为不变。
 
-4. **休眠状态感知**：脚本在连接沙箱前（Step 2）通过 E2B SDK `get_info()` 检测原沙箱是否处于休眠状态。若原沙箱休眠中：
-   - `--pause-after 0`（默认）：升级完成后立即通过 SDK `pause()` 暂停新沙箱
-   - `--pause-after N`（N > 0）：创建时传入 `lifecycle={'on_timeout': 'pause'}` 和 `timeout=N`，由服务端在 N 秒后自动暂停
-   - 若原沙箱非休眠状态，跳过此步骤
+4. **休眠状态感知**：脚本在连接沙箱前（Step 2）通过 E2B SDK `get_info()` 检测原沙箱是否处于休眠状态。若原沙箱休眠中且原沙箱有 pauseTime，则创建时设置 `lifecycle={'on_timeout': 'pause'}` 由服务端自动暂停；若原沙箱休眠中但无 pauseTime，则升级完成后通过 SDK `pause()` 手动暂停。若原沙箱非休眠状态，跳过此步骤。
 
 5. **CSI 配置自动转换**：脚本优先读取 `csi-volume-config` 注解（多卷挂载格式）。若该注解不存在，脚本会回退检查旧版单卷挂载注解（`csi-volume-name`、`csi-mount-point`、`csi-subpath`），并自动转换为多卷挂载格式（`readOnly` 默认为 `false`，即读写挂载，因为旧版注解无 `readOnly` 字段）。若两种格式均不存在，脚本在 Step 1 直接退出，不会连接沙箱。在 `prepare_fix_sts.py` 中，转换后还会自动清除旧版单卷注解。
 
 6. **失败不回滚**：任何步骤失败后该 sandbox 保持当前状态，不会自动恢复。需根据脚本输出中 `[N]` 步骤号定位失败原因，手动处理后重跑。
 
-7. **中途 Checkpoint 自动清理**：升级流程最后一步（Step 8），脚本通过 E2B SDK `Sandbox.delete_snapshot()` 删除快照产生的 Checkpoint。对于需要重新休眠的沙箱，在休眠成功后才删除 Checkpoint。该操作为 best-effort：若删除失败仅打印警告，不影响升级流程。
+7. **中途 Checkpoint 清理**：升级流程最后一步（Step 8），仅在指定 `--gc-checkpoint` 时执行，通过 E2B SDK `Sandbox.delete_snapshot()` 删除快照产生的 Checkpoint。默认不删除，保留 checkpoint 以备后续通过 `restore_from_cp.py` 手动恢复。
 
 8. **DNS 策略检查**：创建快照前（Step 3），脚本检查 Sandbox CR 的 `dnsPolicy`，若非 `ClusterFirst` 则自动通过 Kubernetes API patch 修正。该操作不等待 Pod 生效，直接继续后续步骤。
 

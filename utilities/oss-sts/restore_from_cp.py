@@ -40,8 +40,8 @@ parser = argparse.ArgumentParser(
           "       [--shutdown-time SHUTDOWN_TIME]")
 parser.add_argument("--checkpoint", required=True,
     help="Checkpoint ID (the snapshot_id from upgrade_sts.py output)")
-parser.add_argument("-n", "--namespace", required=True,
-    help="Namespace to search for the Checkpoint CR")
+parser.add_argument("-n", "--namespace", default="default",
+    help="Namespace to search for the Checkpoint CR (default: default)")
 parser.add_argument("--kubeconfig", default="",
     help="Path to kubeconfig file\n"
          "(default: use default kubeconfig)")

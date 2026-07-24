@@ -10,53 +10,6 @@ from kubernetes import client, config
 from e2b import SandboxException, SandboxNotFoundException
 from e2b_code_interpreter import Sandbox, SandboxState
 
-# E2B domain and API key: must be provided via environment variables
-E2B_DOMAIN = os.environ.get("E2B_DOMAIN")
-E2B_API_KEY = os.environ.get("E2B_API_KEY")
-if not E2B_DOMAIN or not E2B_API_KEY:
-    print("Error: E2B_DOMAIN and E2B_API_KEY environment variables are required")
-    sys.exit(1)
-
-# Parse command-line arguments
-parser = argparse.ArgumentParser(
-    description="Upgrade a single sandbox via snapshot rebuild",
-    formatter_class=argparse.RawTextHelpFormatter,
-    usage="%(prog)s [-h]\n"
-          "       --name NAME\n"
-          "       [-n NAMESPACE]\n"
-          "       --pv-map PV_MAP\n"
-          "       --default-cred DEFAULT_CRED\n"
-          "       --agent-name AGENT_NAME\n"
-          "       [--kubeconfig KUBECONFIG]\n"
-          "       [--timeout TIMEOUT]\n"
-          "       [--pause-after PAUSE_AFTER]")
-parser.add_argument("--name", required=True, help="Sandbox name (metadata.name)")
-parser.add_argument("-n", "--namespace", default="default", help="Sandbox namespace (default: default)")
-parser.add_argument("--pv-map", required=True,
-    help="PV name mapping: old-pv:new-pv pairs separated by ';'\n"
-         "e.g. 'oss-aksk-pv-1:oss-sts-pv-1;oss-aksk-pv-2:oss-sts-pv-2'")
-parser.add_argument("--default-cred", required=True,
-    help="Default CredentialProvider names:\n"
-         "  'rw-provider' or 'rw-provider:ro-provider'\n"
-         "If ro-provider is omitted, rw-provider is used for both\n"
-         "read-write and read-only mounts.")
-parser.add_argument("--agent-name", required=True,
-    help="Agent application name for the sandbox\n"
-         "(value for security.agents.kruise.io/agent-name annotation)")
-parser.add_argument("--kubeconfig", default="",
-    help="Path to kubeconfig file\n"
-         "(default: use default kubeconfig)")
-parser.add_argument("--timeout", type=int, default=None,
-    help="Sandbox timeout in seconds\n"
-         "(default: preserve original sandbox timeout policy)")
-parser.add_argument("--pause-after", type=int, default=0,
-    help="Timeout in seconds before auto-pausing after upgrade\n"
-         "(only applies if original sandbox was paused)\n"
-         "(default: 0, pause immediately via SDK)")
-args = parser.parse_args()
-SANDBOX_NAME = args.name
-SANDBOX_NAMESPACE = args.namespace
-
 # Snapshot wait timeout in seconds (server-side sync wait for checkpoint completion)
 SNAPSHOT_WAIT_SUCCESS_SECONDS = 120
 
@@ -354,216 +307,285 @@ def clone_from_snapshot(snapshot_id, sandbox_id, metadata, timeout=0, auto_pause
                 continue
         raise TimeoutError(f"Sandbox {sandbox_id} not ready after {RETRY_TIMEOUT}s")
 
-# ── Step 1: Read and transform CSI volume config ──
 
-sandbox_id = f"{SANDBOX_NAMESPACE}--{SANDBOX_NAME}"
+# ---------------------------------------------------------------------------
+# Main upgrade flow
+# ---------------------------------------------------------------------------
 
-# Initialize Kubernetes API client
-api = load_k8s_client(args.kubeconfig)
+class UpgradeSkipped(Exception):
+    """Raised when a sandbox is skipped (already upgraded, not E2B-owned, etc.)."""
+    pass
 
-# Pre-check: verify sandbox was created via E2B (has agents.kruise.io/owner annotation)
-try:
+
+def main(args):
+    """
+    Execute the sandbox upgrade flow (snapshot → kill → clone → re-pause).
+
+    Can be called directly from another Python script. The caller must ensure
+    E2B_DOMAIN and E2B_API_KEY environment variables are set before calling.
+
+    Args:
+        args: An object with the following attributes:
+            - name (str): Sandbox name (metadata.name)
+            - namespace (str): Sandbox namespace
+            - pv_map (str): PV mapping, e.g. 'old1:new1;old2:new2'
+            - default_cred (str): CredentialProvider, e.g. 'rw' or 'rw:ro'
+            - agent_name (str): Agent application name
+            - kubeconfig (str): Path to kubeconfig ("" for default)
+            - timeout (int or None): Sandbox timeout in seconds
+            - gc_checkpoint (bool): Delete intermediate checkpoint after upgrade
+    """
+    SANDBOX_NAME = args.name
+    SANDBOX_NAMESPACE = args.namespace
+    sandbox_id = f"{SANDBOX_NAMESPACE}--{SANDBOX_NAME}"
+
+    # Initialize Kubernetes API client
+    api = load_k8s_client(args.kubeconfig)
+
+    # Pre-check: verify sandbox was created via E2B (has agents.kruise.io/owner annotation)
     cr = get_sandbox_cr(api, SANDBOX_NAMESPACE, SANDBOX_NAME)
-except RuntimeError as e:
-    print(f"Error: failed to get sandbox CR: {e}")
-    sys.exit(1)
-annotations = cr.get("metadata", {}).get("annotations", {}) or {}
-if not annotations.get("agents.kruise.io/owner"):
-    print(f"Sandbox {SANDBOX_NAMESPACE}/{SANDBOX_NAME} has no 'agents.kruise.io/owner' annotation, "
-          f"not created via E2B, skipping upgrade")
-    sys.exit(0)
+    annotations = cr.get("metadata", {}).get("annotations", {}) or {}
+    if not annotations.get("agents.kruise.io/owner"):
+        raise UpgradeSkipped(
+            f"Sandbox {SANDBOX_NAMESPACE}/{SANDBOX_NAME} has no 'agents.kruise.io/owner' annotation, "
+            f"not created via E2B, skipping upgrade")
+    if annotations.get("security.agents.kruise.io/agent-name"):
+        raise UpgradeSkipped(
+            f"Sandbox {SANDBOX_NAMESPACE}/{SANDBOX_NAME} already has 'security.agents.kruise.io/agent-name' "
+            f"annotation, already upgraded, skipping")
 
-# ── Step 1: Read and transform CSI volume config ──
+    # ── Step 1: Read and transform CSI volume config ──
 
-print(f"[1] Reading CSI volume config from sandbox CR...")
+    print(f"[1] Reading CSI volume config from sandbox CR...")
 
-pv_map = parse_pv_map(args.pv_map)
-cred_rw, cred_ro = parse_default_cred(args.default_cred)
-try:
+    pv_map = parse_pv_map(args.pv_map)
+    cred_rw, cred_ro = parse_default_cred(args.default_cred)
     csi_config_json = fetch_and_transform_csi_config(
         cr, pv_map, cred_rw, cred_ro
     )
-except Exception as e:
-    print(f"    Error: failed to fetch CSI config: {e}")
-    sys.exit(1)
-if csi_config_json:
-    print(f"    Transformed CSI config: {csi_config_json}")
-else:
-    print(f"    No CSI config found on sandbox CR, skip STS upgrade")
-    sys.exit(1)
+    if csi_config_json:
+        print(f"    Transformed CSI config: {csi_config_json}")
+    else:
+        raise UpgradeSkipped(f"No CSI config found on sandbox CR, skip STS upgrade")
 
-shutdown_time, pause_time = fetch_sandbox_timeout_config(cr)
-if shutdown_time:
-    print(f"    Original sandbox ShutdownTime: {shutdown_time}")
-else:
-    print(f"    Original sandbox has no ShutdownTime (never-timeout)")
-if pause_time:
-    print(f"    Original sandbox PauseTime: {pause_time}")
+    shutdown_time, pause_time = fetch_sandbox_timeout_config(cr)
+    if shutdown_time:
+        print(f"    Original sandbox ShutdownTime: {shutdown_time}")
+    else:
+        print(f"    Original sandbox has no ShutdownTime (never-timeout)")
+    if pause_time:
+        print(f"    Original sandbox PauseTime: {pause_time}")
 
-# ── Step 2: Connect to the existing sandbox ──
+    # ── Step 2: Connect to the existing sandbox ──
 
-print(f"[2] Connecting to sandbox: {sandbox_id}")
+    print(f"[2] Connecting to sandbox: {sandbox_id}")
 
-# Check if sandbox is paused before connecting (connect will auto-resume)
-try:
+    # Check if sandbox is paused before connecting (connect will auto-resume)
     was_paused = check_sandbox_paused(sandbox_id)
-except Exception as e:
-    print(f"[2] Error: {e}")
-    sys.exit(1)
-if was_paused:
-    print(f"    Original sandbox is paused, will re-pause after upgrade")
+    if was_paused:
+        print(f"    Original sandbox is paused, will re-pause after upgrade")
 
-try:
-    sbx = Sandbox.connect(
-        sandbox_id=sandbox_id,
-    )
-except Exception as e:
-    print(f"[2] Failed to connect: {e}")
-    raise
-print(f"    Connected. sandbox id: {sbx.sandbox_id}")
-
-# ── Step 3: Ensure DNS policy is ClusterFirst ──
-
-print(f"[3] Checking DNS policy...")
-try:
-    check_and_fix_dns_policy(api, cr, SANDBOX_NAMESPACE, SANDBOX_NAME)
-except Exception as e:
-    print(f"    Error: {e}")
-    sys.exit(1)
-
-# ── Step 4: Create a snapshot ──
-
-# Wait for DNS policy patch to take effect before snapshotting
-print(f"    Waiting 5s for DNS policy to take effect...")
-time.sleep(5)
-
-print(f"[4] Creating snapshot...")
-try:
-    snapshot_info = sbx.create_snapshot(
-        headers={
-            "x-e2b-kruise-snapshot-keep-running": "false",
-            "x-e2b-kruise-snapshot-wait-success-seconds": str(SNAPSHOT_WAIT_SUCCESS_SECONDS),
-        },
-    )
-except Exception as e:
-    print(f"[4] Failed to create snapshot: {e}")
-    raise
-snapshot_id = snapshot_info.snapshot_id
-print(f"    Snapshot created: {snapshot_id}")
-
-# Print restore command for recovery if subsequent steps fail
-restore_cmd = f"python3 restore_from_cp.py --checkpoint {snapshot_id} -n {SANDBOX_NAMESPACE}"
-if pause_time:
-    restore_cmd += f" --pause-time {pause_time}"
-elif shutdown_time:
-    restore_cmd += f" --shutdown-time {shutdown_time}"
-print(f"    If upgrade fails after this point, restore with:")
-print(f"    {restore_cmd}")
-
-# ── Step 5: Kill the original sandbox and wait for it to be fully gone ──
-
-print(f"[5] Killing original sandbox: {sandbox_id}")
-sbx.kill()
-print(f"    Kill request sent, waiting for sandbox to be fully removed...")
-
-deadline = time.time() + KILL_WAIT_TIMEOUT
-while time.time() < deadline:
     try:
-        Sandbox.get_info(
+        sbx = Sandbox.connect(
             sandbox_id=sandbox_id,
         )
-        time.sleep(KILL_POLL_INTERVAL)
-    except SandboxNotFoundException:
-        break
-    except Exception:
-        # Sandbox may be in 'dead' state which SDK can't parse; keep polling
-        time.sleep(KILL_POLL_INTERVAL)
-else:
-    raise TimeoutError(f"Sandbox {sandbox_id} still exists after {KILL_WAIT_TIMEOUT}s")
-
-print(f"    Sandbox fully removed.")
-
-# ── Step 6: Recreate sandbox from snapshot with the same name ──
-
-print(f"[6] Creating new sandbox from snapshot '{snapshot_id}' with name '{SANDBOX_NAME}'...")
-
-# Determine timeout policy:
-# 1. --pause-after > 0 and was_paused: auto_pause with pause_after (user override)
-# 2. pause_time set: auto_pause with remaining from pause_time (preserve original config)
-# 3. --timeout specified: use that timeout
-# 4. No shutdownTime: never-timeout
-# 5. Else: remaining from shutdownTime
-use_auto_pause = False
-
-if was_paused and args.pause_after > 0:
-    use_auto_pause = True
-    clone_timeout = args.pause_after
-    never_timeout = False
-elif pause_time:
-    use_auto_pause = True
-    pause_dt = datetime.fromisoformat(pause_time.replace("Z", "+00:00"))
-    now_dt = datetime.now(timezone.utc)
-    clone_timeout = max(6000, int((pause_dt - now_dt).total_seconds()))
-    never_timeout = False
-    print(f"    Using auto-pause with remaining timeout: {clone_timeout}s (pauseTime: {pause_time})")
-elif args.timeout is not None:
-    clone_timeout = args.timeout
-    never_timeout = False
-elif shutdown_time is None:
-    clone_timeout = 0
-    never_timeout = True
-else:
-    # No --timeout specified, sandbox was running, has shutdownTime.
-    # Use remaining time from original sandbox's shutdownTime.
-    shutdown_dt = datetime.fromisoformat(shutdown_time.replace("Z", "+00:00"))
-    now_dt = datetime.now(timezone.utc)
-    clone_timeout = max(6000, int((shutdown_dt - now_dt).total_seconds()))
-    never_timeout = False
-    if clone_timeout > 0:
-        print(f"    Using remaining timeout from original sandbox: {clone_timeout}s (shutdownTime: {shutdown_time})")
-    else:
-        print(f"    Original shutdownTime has passed, using default timeout")
-
-metadata = {
-    "e2b.agents.kruise.io/sandbox-name": SANDBOX_NAME,
-    "e2b.agents.kruise.io/reserve-failed-sandbox-for": "forever",
-    "e2b.agents.kruise.io/csi-volume-config": csi_config_json,
-    "security.agents.kruise.io/agent-name": args.agent_name
-}
-if never_timeout:
-    metadata["e2b.agents.kruise.io/never-timeout"] = "true"
-
-new_sbx = clone_from_snapshot(snapshot_id, sandbox_id, metadata,
-                              timeout=clone_timeout, auto_pause=use_auto_pause)
-print(f"    Done!")
-
-# ── Step 7: Re-pause if original sandbox was paused ──
-
-if use_auto_pause:
-    print(f"[7] Auto-pause enabled, sandbox will be auto-paused by server.")
-    print(f"    No need to wait, upgrade is complete.")
-elif was_paused:
-    print(f"[7] Re-pausing sandbox (original was paused)...")
-    try:
-        pause_sandbox(new_sbx)
     except Exception as e:
-        print(f"    Failed to pause sandbox: {e}")
-        print(f"    Please manually pause it")
-        sys.exit(1)
-    print(f"    Pause request sent, waiting for sandbox to be paused...")
-    if wait_for_paused(sandbox_id, PAUSE_WAIT_TIMEOUT, PAUSE_POLL_INTERVAL):
-        print(f"    Sandbox paused.")
+        print(f"[2] Failed to connect: {e}")
+        raise
+    print(f"    Connected. sandbox id: {sbx.sandbox_id}")
+
+    # ── Step 3: Ensure DNS policy is ClusterFirst ──
+
+    print(f"[3] Checking DNS policy...")
+    check_and_fix_dns_policy(api, cr, SANDBOX_NAMESPACE, SANDBOX_NAME)
+
+    # ── Step 4: Create a snapshot ──
+
+    # Wait for DNS policy patch to take effect before snapshotting
+    print(f"    Waiting 5s for DNS policy to take effect...")
+    time.sleep(5)
+
+    print(f"[4] Creating snapshot...")
+    try:
+        snapshot_info = sbx.create_snapshot(
+            headers={
+                "x-e2b-kruise-snapshot-keep-running": "false",
+                "x-e2b-kruise-snapshot-wait-success-seconds": str(SNAPSHOT_WAIT_SUCCESS_SECONDS),
+            },
+        )
+    except Exception as e:
+        print(f"[4] Failed to create snapshot: {e}")
+        raise
+    snapshot_id = snapshot_info.snapshot_id
+    print(f"    Snapshot created: {snapshot_id}")
+
+    # Print restore command for recovery if subsequent steps fail
+    restore_cmd = f"python3 restore_from_cp.py --checkpoint {snapshot_id} -n {SANDBOX_NAMESPACE}"
+    if pause_time:
+        restore_cmd += f" --pause-time {pause_time}"
+    elif shutdown_time:
+        restore_cmd += f" --shutdown-time {shutdown_time}"
+    print(f"    If upgrade fails after this point, restore with:")
+    print(f"    {restore_cmd}")
+
+    # ── Step 5: Kill the original sandbox and wait for it to be fully gone ──
+
+    print(f"[5] Killing original sandbox: {sandbox_id}")
+    sbx.kill()
+    print(f"    Kill request sent, waiting for sandbox to be fully removed...")
+
+    deadline = time.time() + KILL_WAIT_TIMEOUT
+    while time.time() < deadline:
+        try:
+            Sandbox.get_info(
+                sandbox_id=sandbox_id,
+            )
+            time.sleep(KILL_POLL_INTERVAL)
+        except SandboxNotFoundException:
+            break
+        except Exception:
+            # Sandbox may be in 'dead' state which SDK can't parse; keep polling
+            time.sleep(KILL_POLL_INTERVAL)
     else:
-        print(f"    Timeout waiting for sandbox to pause after {PAUSE_WAIT_TIMEOUT}s")
+        raise TimeoutError(f"Sandbox {sandbox_id} still exists after {KILL_WAIT_TIMEOUT}s")
+
+    print(f"    Sandbox fully removed.")
+
+    # ── Step 6: Recreate sandbox from snapshot with the same name ──
+
+    print(f"[6] Creating new sandbox from snapshot '{snapshot_id}' with name '{SANDBOX_NAME}'...")
+
+    # Determine timeout policy:
+    # 1. pause_time set: auto_pause with remaining from pause_time (preserve original config)
+    # 2. --timeout specified: use that timeout
+    # 3. No shutdownTime: never-timeout
+    # 4. Else: remaining from shutdownTime
+    use_auto_pause = False
+
+    if pause_time:
+        use_auto_pause = True
+        never_timeout = False
+        if args.timeout is not None:
+            clone_timeout = args.timeout
+            print(f"    Using pause timeout: {clone_timeout}s (pauseTime: {pause_time})")
+        else:
+            pause_dt = datetime.fromisoformat(pause_time.replace("Z", "+00:00"))
+            now_dt = datetime.now(timezone.utc)
+            clone_timeout = max(600, int((pause_dt - now_dt).total_seconds()))
+            print(f"    Using auto-pause with remaining timeout: {clone_timeout}s (pauseTime: {pause_time})")
+    elif shutdown_time is None:
+        clone_timeout = 0
+        never_timeout = True
+    elif args.timeout is not None:
+        clone_timeout = args.timeout
+        never_timeout = False
+    else:
+        # No --timeout specified, sandbox was running, has shutdownTime.
+        # Use remaining time from original sandbox's shutdownTime.
+        shutdown_dt = datetime.fromisoformat(shutdown_time.replace("Z", "+00:00"))
+        now_dt = datetime.now(timezone.utc)
+        clone_timeout = max(600, int((shutdown_dt - now_dt).total_seconds()))
+        never_timeout = False
+        if clone_timeout > 0:
+            print(f"    Using remaining timeout from original sandbox: {clone_timeout}s (shutdownTime: {shutdown_time})")
+        else:
+            print(f"    Original shutdownTime has passed, using default timeout")
+
+    metadata = {
+        "e2b.agents.kruise.io/sandbox-name": SANDBOX_NAME,
+        "e2b.agents.kruise.io/reserve-failed-sandbox-for": "forever",
+        "e2b.agents.kruise.io/csi-volume-config": csi_config_json,
+        "security.agents.kruise.io/agent-name": args.agent_name
+    }
+    if never_timeout:
+        metadata["e2b.agents.kruise.io/never-timeout"] = "true"
+
+    new_sbx = clone_from_snapshot(snapshot_id, sandbox_id, metadata,
+                                  timeout=clone_timeout, auto_pause=use_auto_pause)
+    print(f"    Done!")
+
+    # ── Step 7: Re-pause if original sandbox was paused ──
+
+    if use_auto_pause:
+        print(f"[7] Auto-pause enabled, sandbox will be auto-paused by server.")
+        print(f"    No need to wait, upgrade is complete.")
+    elif was_paused:
+        print(f"[7] Re-pausing sandbox (original was paused)...")
+        try:
+            pause_sandbox(new_sbx)
+        except Exception:
+            print(f"    Please manually pause it")
+            raise
+        print(f"    Pause request sent, waiting for sandbox to be paused...")
+        if wait_for_paused(sandbox_id, PAUSE_WAIT_TIMEOUT, PAUSE_POLL_INTERVAL):
+            print(f"    Sandbox paused.")
+        else:
+            raise TimeoutError(f"Timeout waiting for sandbox to pause after {PAUSE_WAIT_TIMEOUT}s")
+    else:
+        print(f"[7] Skipping re-pause (original was not paused)")
+
+    # ── Step 8: Delete intermediate checkpoint ──
+
+    if args.gc_checkpoint:
+        print(f"[8] Deleting intermediate checkpoint: {snapshot_id}")
+        delete_snapshot(snapshot_id)
+    else:
+        print(f"[8] Skipping checkpoint deletion (--gc-checkpoint not set): {snapshot_id}")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # E2B domain and API key: must be provided via environment variables
+    E2B_DOMAIN = os.environ.get("E2B_DOMAIN")
+    E2B_API_KEY = os.environ.get("E2B_API_KEY")
+    if not E2B_DOMAIN or not E2B_API_KEY:
+        print("Error: E2B_DOMAIN and E2B_API_KEY environment variables are required")
         sys.exit(1)
-else:
-    print(f"[7] Skipping re-pause (original was not paused)")
 
-# ── Step 8: Delete intermediate checkpoint ──
-
-print(f"[8] Deleting intermediate checkpoint: {snapshot_id}")
-try:
-    delete_snapshot(snapshot_id)
-except Exception as e:
-    print(f"    Error: failed to delete checkpoint {snapshot_id}: {e}")
-    sys.exit(1)
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Upgrade a single sandbox via snapshot rebuild",
+        formatter_class=argparse.RawTextHelpFormatter,
+        usage="%(prog)s [-h]\n"
+              "       --name NAME\n"
+              "       [-n NAMESPACE]\n"
+              "       --pv-map PV_MAP\n"
+              "       --default-cred DEFAULT_CRED\n"
+              "       --agent-name AGENT_NAME\n"
+              "       [--kubeconfig KUBECONFIG]\n"
+              "       [--timeout TIMEOUT]\n"
+              "       [--gc-checkpoint]")
+    parser.add_argument("--name", required=True, help="Sandbox name (metadata.name)")
+    parser.add_argument("-n", "--namespace", default="default", help="Sandbox namespace (default: default)")
+    parser.add_argument("--pv-map", required=True,
+        help="PV name mapping: old-pv:new-pv pairs separated by ';'\n"
+             "e.g. 'oss-aksk-pv-1:oss-sts-pv-1;oss-aksk-pv-2:oss-sts-pv-2'")
+    parser.add_argument("--default-cred", required=True,
+        help="Default CredentialProvider names:\n"
+             "  'rw-provider' or 'rw-provider:ro-provider'\n"
+             "If ro-provider is omitted, rw-provider is used for both\n"
+             "read-write and read-only mounts.")
+    parser.add_argument("--agent-name", required=True,
+        help="Agent application name for the sandbox\n"
+             "(value for security.agents.kruise.io/agent-name annotation)")
+    parser.add_argument("--kubeconfig", default="",
+        help="Path to kubeconfig file\n"
+             "(default: use default kubeconfig)")
+    parser.add_argument("--timeout", type=int, default=None,
+        help="Sandbox timeout in seconds\n"
+             "(default: preserve original sandbox timeout policy)")
+    parser.add_argument("--gc-checkpoint", action="store_true", default=False,
+        help="Delete intermediate checkpoint after upgrade\n"
+             "(default: False, checkpoint is preserved for manual restore)")
+    cli_args = parser.parse_args()
+    try:
+        main(cli_args)
+    except UpgradeSkipped as e:
+        print(e)
+        sys.exit(0)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
