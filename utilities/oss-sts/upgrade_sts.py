@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 import sys
@@ -223,19 +224,140 @@ def fetch_sandbox_timeout_config(cr):
     return shutdown_time, pause_time
 
 
-def check_and_fix_dns_policy(api, cr, namespace, name):
+def check_and_fix_spec(api, cr, namespace, name):
     """
-    Check sandbox CR's dnsPolicy from the given CR dict. If not ClusterFirst, patch it.
+    Check and fix sandbox CR: ensure dnsPolicy is ClusterFirst, ensure spec.runtimes
+    includes csi and agent-runtime (preserving other runtimes like traffic-proxy),
+    and remove legacy initContainers (init, csi-sidecar, csi-agent-sidecar) and
+    volumes that are now injected via the runtime mechanism, and remove legacy
+    postStart hooks (envd-run.sh) from non-init containers. All fixes are applied
+    in a single patch.
     No wait — proceed after patching.
     """
-    current = cr.get("spec", {}).get("template", {}).get("spec", {}).get("dnsPolicy", "")
+    spec = cr.get("spec", {})
+    template_spec = spec.get("template", {}).get("spec", {})
 
-    if current == "ClusterFirst":
+    # --- Check dnsPolicy ---
+    current_dns = template_spec.get("dnsPolicy", "")
+    need_dns_fix = current_dns != "ClusterFirst"
+    if need_dns_fix:
+        print(f"    Current dnsPolicy: '{current_dns}', will patch to ClusterFirst")
+    else:
         print(f"    DNS policy is already ClusterFirst")
+
+    # --- Check spec.runtimes: ensure csi and agent-runtime are present ---
+    runtimes = spec.get("runtimes", []) or []
+    runtime_names = {r.get("name") for r in runtimes}
+    need_runtimes_fix = False
+    new_runtimes = list(runtimes)  # preserve existing runtimes (e.g. traffic-proxy)
+    for required in ("csi", "agent-runtime"):
+        if required not in runtime_names:
+            new_runtimes.append({"name": required})
+            need_runtimes_fix = True
+            print(f"    Adding runtime '{required}' to spec.runtimes")
+    if not need_runtimes_fix:
+        print(f"    spec.runtimes already includes csi and agent-runtime")
+
+    # --- Check initContainers: remove legacy sidecar containers ---
+    init_containers = template_spec.get("initContainers", []) or []
+    remove_names = {"init", "csi-sidecar", "csi-agent-sidecar"}
+    filtered_init = [c for c in init_containers if c.get("name") not in remove_names]
+    need_init_fix = len(filtered_init) < len(init_containers)
+    if need_init_fix:
+        removed = [c.get("name") for c in init_containers if c.get("name") in remove_names]
+        print(f"    Removing legacy initContainers: {', '.join(removed)}")
+    else:
+        print(f"    No legacy sidecar initContainers to remove")
+
+    # --- Check volumes: remove legacy sidecar volumes ---
+    volumes = template_spec.get("volumes", []) or []
+    remove_vol_names = {
+        "envd-volume", "fuse-device", "mount-root", "nas-plugin-dir",
+        "oss-plugin-dir", "run-cnfs", "efc-metrics-dir",
+        "ossfs-metrics-dir", "csi-agent-config", "token-volume",
+    }
+    filtered_volumes = [v for v in volumes if v.get("name") not in remove_vol_names]
+    need_volumes_fix = len(filtered_volumes) < len(volumes)
+    if need_volumes_fix:
+        removed_vols = [v.get("name") for v in volumes if v.get("name") in remove_vol_names]
+        print(f"    Removing legacy volumes: {', '.join(removed_vols)}")
+    else:
+        print(f"    No legacy sidecar volumes to remove")
+
+    # --- Check containers: remove legacy postStart hooks (envd-run.sh) ---
+    containers = template_spec.get("containers", []) or []
+    new_containers = copy.deepcopy(containers)
+    need_poststart_fix = False
+    for c in new_containers:
+        lifecycle = c.get("lifecycle")
+        if not lifecycle:
+            continue
+        post_start = lifecycle.get("postStart")
+        if not post_start:
+            continue
+        command = post_start.get("exec", {}).get("command", [])
+        if "/mnt/envd/envd-run.sh" in command:
+            del lifecycle["postStart"]
+            if not lifecycle:
+                del c["lifecycle"]
+            need_poststart_fix = True
+            print(f"    Removing postStart hook from container '{c.get('name')}'")
+    if not need_poststart_fix:
+        print(f"    No legacy postStart hooks to remove")
+
+    # --- Check containers: remove legacy sidecar volumeMounts ---
+    need_volumemount_fix = False
+    for c in new_containers:
+        mounts = c.get("volumeMounts", []) or []
+        filtered_mounts = [m for m in mounts if m.get("name") not in remove_vol_names]
+        if len(filtered_mounts) < len(mounts):
+            c["volumeMounts"] = filtered_mounts
+            need_volumemount_fix = True
+            removed_mounts = [m.get("name") for m in mounts if m.get("name") in remove_vol_names]
+            print(f"    Removing volumeMounts from container '{c.get('name')}': {', '.join(removed_mounts)}")
+    if not need_volumemount_fix:
+        print(f"    No legacy sidecar volumeMounts to remove")
+
+    # --- Check containers: remove legacy runtime env vars ---
+    remove_env_names = {"ENVD_DIR", "POD_UID", "GODEBUG"}
+    need_env_fix = False
+    for c in new_containers:
+        envs = c.get("env", []) or []
+        filtered_envs = [e for e in envs if e.get("name") not in remove_env_names]
+        if len(filtered_envs) < len(envs):
+            c["env"] = filtered_envs
+            need_env_fix = True
+            removed_envs = [e.get("name") for e in envs if e.get("name") in remove_env_names]
+            print(f"    Removing env vars from container '{c.get('name')}': {', '.join(removed_envs)}")
+    if not need_env_fix:
+        print(f"    No legacy runtime env vars to remove")
+
+    # --- Apply patch if any fixes are needed ---
+    if not (need_dns_fix or need_runtimes_fix or need_init_fix
+            or need_volumes_fix or need_poststart_fix
+            or need_volumemount_fix or need_env_fix):
         return
 
-    print(f"    Current dnsPolicy: '{current}', patching to ClusterFirst and clearing upgradePolicy...")
-    patch = {"spec": {"template": {"spec": {"dnsPolicy": "ClusterFirst"}}, "upgradePolicy": None}}
+    spec_patch = {}
+    if need_dns_fix:
+        spec_patch["template"] = {"spec": {"dnsPolicy": "ClusterFirst"}}
+        spec_patch["upgradePolicy"] = None
+    if need_runtimes_fix:
+        spec_patch["runtimes"] = new_runtimes
+    if need_init_fix:
+        if "template" not in spec_patch:
+            spec_patch["template"] = {"spec": {}}
+        spec_patch["template"]["spec"]["initContainers"] = filtered_init
+    if need_volumes_fix:
+        if "template" not in spec_patch:
+            spec_patch["template"] = {"spec": {}}
+        spec_patch["template"]["spec"]["volumes"] = filtered_volumes
+    if need_poststart_fix or need_volumemount_fix or need_env_fix:
+        if "template" not in spec_patch:
+            spec_patch["template"] = {"spec": {}}
+        spec_patch["template"]["spec"]["containers"] = new_containers
+
+    patch = {"spec": spec_patch}
     try:
         api.patch_namespaced_custom_object(
             group=SANDBOX_GROUP, version=SANDBOX_VERSION,
@@ -243,9 +365,7 @@ def check_and_fix_dns_policy(api, cr, namespace, name):
             body=patch,
         )
     except client.ApiException as e:
-        raise RuntimeError(f"Failed to patch dnsPolicy: {e.reason} (status {e.status})")
-    print(f"    DNS policy patched to ClusterFirst, upgradePolicy cleared")
-
+        raise RuntimeError(f"Failed to patch sandbox CR: {e.reason} (status {e.status})")
 
 # ---------------------------------------------------------------------------
 # Clone helper
@@ -397,7 +517,7 @@ def main(args):
     # ── Step 3: Ensure DNS policy is ClusterFirst ──
 
     print(f"[3] Checking DNS policy...")
-    check_and_fix_dns_policy(api, cr, SANDBOX_NAMESPACE, SANDBOX_NAME)
+    check_and_fix_spec(api, cr, SANDBOX_NAMESPACE, SANDBOX_NAME)
 
     # ── Step 4: Create a snapshot ──
 
