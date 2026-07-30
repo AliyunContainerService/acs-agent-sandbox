@@ -361,6 +361,7 @@ else:
 # Build minimal metadata
 metadata = {
     "e2b.agents.kruise.io/sandbox-name": sandbox_name,
+    "e2b.agents.kruise.io/reserve-failed-sandbox-for": "forever",
 }
 if never_timeout:
     metadata["e2b.agents.kruise.io/never-timeout"] = "true"
