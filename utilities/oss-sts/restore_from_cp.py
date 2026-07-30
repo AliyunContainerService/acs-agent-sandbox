@@ -2,7 +2,8 @@
 """
 Restore a sandbox from a pre-existing checkpoint.
 
-Looks up the Checkpoint CR by checkpoint ID to get the sandbox name,
+Looks up the Checkpoint CR either by checkpoint ID (listing the namespace)
+or directly by namespace/name via --checkpoint-cr, gets the sandbox name,
 checks if the sandbox already exists (exits if running/paused/dead),
 and clones a new sandbox from the checkpoint.
 
@@ -33,13 +34,19 @@ parser = argparse.ArgumentParser(
     description="Restore a sandbox from a pre-existing checkpoint",
     formatter_class=argparse.RawTextHelpFormatter,
     usage="%(prog)s [-h]\n"
-          "       --checkpoint CHECKPOINT_ID\n"
-          "       -n NAMESPACE\n"
+          "       [--checkpoint CHECKPOINT_ID]\n"
+          "       [--checkpoint-cr NAMESPACE/NAME]\n"
+          "       [-n NAMESPACE]\n"
           "       [--kubeconfig KUBECONFIG]\n"
           "       [--pause-time PAUSE_TIME]\n"
           "       [--shutdown-time SHUTDOWN_TIME]")
-parser.add_argument("--checkpoint", required=True,
-    help="Checkpoint ID (the snapshot_id from upgrade_sts.py output)")
+parser.add_argument("--checkpoint", default=None,
+    help="Checkpoint ID (the snapshot_id from upgrade_sts.py output)\n"
+         "(required unless --checkpoint-cr is given)")
+parser.add_argument("--checkpoint-cr", default=None,
+    help="Checkpoint CR reference in 'namespace/name' format\n"
+         "(locates the Checkpoint CR directly instead of searching\n"
+         "by checkpoint ID; the checkpoint ID is read from its status)")
 parser.add_argument("-n", "--namespace", default="default",
     help="Namespace to search for the Checkpoint CR (default: default)")
 parser.add_argument("--kubeconfig", default="",
@@ -57,6 +64,17 @@ args = parser.parse_args()
 if args.pause_time is not None and args.shutdown_time is not None:
     print("Error: --pause-time and --shutdown-time are mutually exclusive")
     sys.exit(1)
+
+# Validate checkpoint reference: need --checkpoint and/or --checkpoint-cr
+if args.checkpoint is None and args.checkpoint_cr is None:
+    print("Error: either --checkpoint or --checkpoint-cr is required")
+    sys.exit(1)
+if args.checkpoint_cr is not None:
+    parts = args.checkpoint_cr.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        print(f"Error: --checkpoint-cr must be 'namespace/name', got '{args.checkpoint_cr}'")
+        sys.exit(1)
+    checkpoint_cr_namespace, checkpoint_cr_name = parts
 
 # Retry config for clone (handles ALB 504, 409 conflict)
 RETRY_TIMEOUT = 600
@@ -103,6 +121,21 @@ def find_checkpoint_cr(api, namespace, checkpoint_id):
         if cp.get("status", {}).get("checkpointId") == checkpoint_id:
             return cp
     return None
+
+
+def get_checkpoint_cr(api, namespace, name):
+    """Get a Checkpoint CR directly by namespace/name. Returns None if not found."""
+    try:
+        return api.get_namespaced_custom_object(
+            group=CHECKPOINT_GROUP, version=CHECKPOINT_VERSION,
+            namespace=namespace, plural=CHECKPOINT_PLURAL, name=name,
+        )
+    except client.ApiException as e:
+        if e.status == 404:
+            return None
+        raise RuntimeError(
+            f"Failed to get checkpoint CR {namespace}/{name}: {e.reason} (status {e.status})"
+        )
 
 
 def get_sandbox_cr(api, namespace, name):
@@ -211,37 +244,63 @@ def clone_from_snapshot(snapshot_id, sandbox_id, metadata, timeout=0, auto_pause
 
 # ── Step 1: Find Checkpoint CR and get sandbox name ──
 
-print(f"[1] Looking up checkpoint: {args.checkpoint} in namespace {args.namespace}")
-
 api = load_k8s_client(args.kubeconfig)
 
-try:
-    checkpoint_cr = find_checkpoint_cr(api, args.namespace, args.checkpoint)
-except RuntimeError as e:
-    print(f"[1] Error: {e}")
-    sys.exit(1)
+if args.checkpoint_cr is not None:
+    print(f"[1] Looking up checkpoint CR: {args.checkpoint_cr}")
+    try:
+        checkpoint_cr = get_checkpoint_cr(api, checkpoint_cr_namespace, checkpoint_cr_name)
+    except RuntimeError as e:
+        print(f"[1] Error: {e}")
+        sys.exit(1)
+    if checkpoint_cr is None:
+        print(f"[1] Error: Checkpoint CR {args.checkpoint_cr} not found")
+        sys.exit(1)
+    sandbox_namespace = checkpoint_cr_namespace
+else:
+    print(f"[1] Looking up checkpoint: {args.checkpoint} in namespace {args.namespace}")
+    try:
+        checkpoint_cr = find_checkpoint_cr(api, args.namespace, args.checkpoint)
+    except RuntimeError as e:
+        print(f"[1] Error: {e}")
+        sys.exit(1)
+    if checkpoint_cr is None:
+        print(f"[1] Error: Checkpoint {args.checkpoint} not found in namespace {args.namespace}")
+        sys.exit(1)
+    sandbox_namespace = args.namespace
 
-if checkpoint_cr is None:
-    print(f"[1] Error: Checkpoint {args.checkpoint} not found in namespace {args.namespace}")
-    sys.exit(1)
+# Resolve the checkpoint ID: prefer --checkpoint, else read from CR status
+cr_checkpoint_id = checkpoint_cr.get("status", {}).get("checkpointId", "")
+if args.checkpoint is not None:
+    if cr_checkpoint_id and cr_checkpoint_id != args.checkpoint:
+        print(f"[1] Error: --checkpoint '{args.checkpoint}' does not match "
+              f"checkpoint CR status.checkpointId '{cr_checkpoint_id}'")
+        sys.exit(1)
+    checkpoint_id = args.checkpoint
+else:
+    if not cr_checkpoint_id:
+        print(f"[1] Error: Checkpoint CR {args.checkpoint_cr} has no status.checkpointId")
+        sys.exit(1)
+    checkpoint_id = cr_checkpoint_id
+    print(f"    Checkpoint ID from CR status: {checkpoint_id}")
 
 checkpoint_phase = checkpoint_cr.get("status", {}).get("phase", "")
 if checkpoint_phase != "Succeeded":
-    print(f"[1] Error: Checkpoint {args.checkpoint} phase is '{checkpoint_phase}', expected 'Succeeded'")
+    print(f"[1] Error: Checkpoint {checkpoint_id} phase is '{checkpoint_phase}', expected 'Succeeded'")
     sys.exit(1)
 print(f"    Checkpoint phase: Succeeded")
 
 sandbox_name = checkpoint_cr.get("spec", {}).get("podName")
 if not sandbox_name:
-    print(f"[1] Error: Checkpoint {args.checkpoint} has no spec.podName")
+    print(f"[1] Error: Checkpoint {checkpoint_id} has no spec.podName")
     sys.exit(1)
 
-sandbox_id = f"{args.namespace}--{sandbox_name}"
+sandbox_id = f"{sandbox_namespace}--{sandbox_name}"
 print(f"    Found checkpoint: sandbox_name={sandbox_name}")
 
 # Check sandbox CR phase — if Failed, delete and wait for removal
 try:
-    sbx_cr = get_sandbox_cr(api, args.namespace, sandbox_name)
+    sbx_cr = get_sandbox_cr(api, sandbox_namespace, sandbox_name)
 except RuntimeError as e:
     print(f"[1] Error: {e}")
     sys.exit(1)
@@ -251,7 +310,7 @@ if sbx_cr is not None:
     if sbx_phase == "Failed":
         print(f"    Sandbox CR phase is Failed, deleting...")
         try:
-            delete_sandbox_cr_and_wait(api, args.namespace, sandbox_name,
+            delete_sandbox_cr_and_wait(api, sandbox_namespace, sandbox_name,
                                        DELETE_WAIT_TIMEOUT, DELETE_POLL_INTERVAL)
         except (RuntimeError, TimeoutError) as e:
             print(f"[1] Error: {e}")
@@ -278,7 +337,7 @@ except Exception as e:
 
 # ── Step 3: Clone from checkpoint ──
 
-print(f"[3] Cloning sandbox from checkpoint '{args.checkpoint}' with name '{sandbox_name}'...")
+print(f"[3] Cloning sandbox from checkpoint '{checkpoint_id}' with name '{sandbox_name}'...")
 
 # Determine timeout policy
 use_auto_pause = False
@@ -306,6 +365,6 @@ metadata = {
 if never_timeout:
     metadata["e2b.agents.kruise.io/never-timeout"] = "true"
 
-clone_from_snapshot(args.checkpoint, sandbox_id, metadata,
+clone_from_snapshot(checkpoint_id, sandbox_id, metadata,
                      timeout=clone_timeout, auto_pause=use_auto_pause)
 print(f"    Done!")

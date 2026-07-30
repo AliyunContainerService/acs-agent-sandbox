@@ -64,6 +64,17 @@ kubectl --kubeconfig /path/to/kubeconfig get AgentIdentity
 2. 针对读写和只读分别创建两个CredientalProvider， 作为后续STS token的权限设置模版
 3. 执行单个升级的脚本， 并传入新老pv的映射关系、CredentialProvider名以及Agent应用名
 
+### 3.0 前置检查（脚本自动执行）
+
+脚本在 Step 1 之前会对沙箱做以下检查：
+
+1. **E2B 归属检查**：沙箱无 `agents.kruise.io/owner` annotation 时跳过升级（非 E2B 创建）
+2. **已升级检查**：沙箱已有 `security.agents.kruise.io/agent-name` annotation 时：
+   - 若同时有 `security.agents.kruise.io/storage-auth` annotation 但 `spec.runtimes` 中**缺少** `csi` 和 `agent-runtime`，则判定为**部分升级**（sidecar 可能异常），脚本自动执行回滚后继续正常升级流程：
+     - 反向转换 `csi-volume-config` annotation：移除 `credentialProviderName` 属性，PV 名映射回老 PV（多个老 PV 映射到同一新 PV 时，选取 creationTimestamp 最早的）
+     - 删除 `security.agents.kruise.io/storage-auth`、`security.agents.kruise.io/agent-name`、`security.agents.kruise.io/token-status` 三个 annotation
+   - 否则判定为已完成升级，直接跳过
+
 ### 3.1 命令格式
 
 ```bash
@@ -139,6 +150,13 @@ E2B_API_KEY=sk-staging-abc123def456 \
     Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
 [3] Checking DNS policy...
     DNS policy is already ClusterFirst
+    Adding runtime 'csi' to spec.runtimes
+    Adding runtime 'agent-runtime' to spec.runtimes
+    Removing legacy initContainers: init, csi-sidecar, csi-agent-sidecar
+    Removing legacy volumes: envd-volume, token-volume
+    Removing postStart hook from container 'sandbox'
+    Removing volumeMounts from container 'sandbox': envd-volume, token-volume
+    Removing env vars from container 'sandbox': ENVD_DIR, POD_UID, GODEBUG
 [4] Creating snapshot...
     Snapshot created: cp-bp100987kj45vjtbrs0c
     If upgrade fails after this point, restore with:
@@ -164,6 +182,12 @@ E2B_API_KEY=sk-staging-abc123def456 \
     Connected. sandbox id: default--code-interpreter-ossfs-agent-identity-fs86f
 [3] Checking DNS policy...
     DNS policy is already ClusterFirst
+    spec.runtimes already includes csi and agent-runtime
+    No legacy sidecar initContainers to remove
+    No legacy sidecar volumes to remove
+    No legacy postStart hooks to remove
+    No legacy sidecar volumeMounts to remove
+    No legacy runtime env vars to remove
 [4] Creating snapshot...
     Snapshot created: cp-bp100987kj45vjtbrs0c
     If upgrade fails after this point, restore with:
@@ -188,7 +212,7 @@ E2B_API_KEY=sk-staging-abc123def456 \
 |----------|----------|----------|
 | [1] Read CSI Config | Kubernetes API 调用失败或无 CSI 配置 | 确认 kubeconfig 路径；若无 CSI 配置脚本会直接退出 |
 | [2] Connect | sandbox 不存在或域名不可达 | 确认 sandbox 名称和 E2B_DOMAIN |
-| [3] DNS Policy | Kubernetes API get/patch 失败 | 脚本打印警告继续执行；可手动 `kubectl patch sbx <name> -n <ns> --type=merge -p '{"spec":{"template":{"spec":{"dnsPolicy":"ClusterFirst"}}}}'` |
+| [3] Spec Fix | Kubernetes API get/patch 失败 | 确认 kubeconfig 权限；可手动 `kubectl patch sbx <name> -n <ns> --type=merge` 修正 dnsPolicy 和 runtimes |
 | [4] Snapshot | checkpoint 超时或服务端异常 | 重试，或检查 sandbox-manager 日志 |
 | [5] Kill | sandbox 删除超时 | 手动 `kubectl delete sbx <name> -n <ns>` 后重试 |
 | [6] Recreate | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
@@ -211,7 +235,8 @@ E2B_API_KEY=sk-staging-abc123def456 \
 
 ```bash
 E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 restore_from_cp.py \
-  --checkpoint <checkpoint_id> \
+  [--checkpoint <checkpoint_id>] \
+  [--checkpoint-cr <namespace/name>] \
   -n <命名空间> \
   [--kubeconfig <kubeconfig路径>] \
   [--pause-time <metav1.Time格式>] \
@@ -222,13 +247,25 @@ E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 restore_from_cp.py \
 |------|------|------|--------|------|
 | E2B_DOMAIN | 环境变量 | 是 | - | sandbox-manager 域名 |
 | E2B_API_KEY | 环境变量 | 是 | - | E2B API Key |
-| `--checkpoint` | 命令行 | 是 | - | Checkpoint ID（`upgrade_sts.py` 输出的 snapshot_id） |
-| `-n`, `--namespace` | 命令行 | 是 | - | Checkpoint 所在命名空间 |
+| `--checkpoint` | 命令行 | 与 `--checkpoint-cr` 二选一 | - | Checkpoint ID（`upgrade_sts.py` 输出的 snapshot_id），在命名空间内遍历匹配 `status.checkpointId` |
+| `--checkpoint-cr` | 命令行 | 与 `--checkpoint` 二选一 | - | Checkpoint CR 引用，格式 `namespace/name`，直接按 namespace/name 定位 Checkpoint CR（checkpoint ID 从其 `status.checkpointId` 读取）；两者同时指定时按此直接定位并校验 ID 一致性 |
+| `-n`, `--namespace` | 命令行 | 否 | `default` | Checkpoint 所在命名空间（仅 `--checkpoint` 方式使用；`--checkpoint-cr` 方式以其 namespace 为准） |
 | `--kubeconfig` | 命令行 | 否 | 默认kubeconfig | kubeconfig文件路径，用于通过 Kubernetes Python 客户端查询 Checkpoint CR |
 | `--pause-time` | 命令行 | 否 | - | 绝对暂停时间，metav1.Time 格式（如 `2026-07-23T16:07:44Z`）。设置后沙箱将在该时间自动暂停 |
 | `--shutdown-time` | 命令行 | 否 | - | 绝对关闭时间，metav1.Time 格式（如 `2026-07-23T16:07:44Z`）。设置后沙箱将在该时间自动关闭 |
 
 > `--pause-time` 和 `--shutdown-time` 互斥，不能同时指定。若都不指定，则设为 never-timeout。
+
+> 两种定位方式的获取途径：
+> - **Checkpoint ID**（`--checkpoint`）可直接从 `upgrade_sts.py` 的输出中获取（`Snapshot created: <checkpoint_id>` 行，升级脚本也会自动打印带此 ID 的恢复命令），是升级失败后恢复的首选方式
+> - **Checkpoint CR 引用**（`--checkpoint-cr`）不会出现在 `upgrade_sts.py` 的输出中，需通过其他方式查询获得，例如按 checkpoint ID 检索 CR：
+>
+>   ```bash
+>   kubectl --kubeconfig /path/to/kubeconfig get checkpoints -n <命名空间> \
+>     -o jsonpath='{range .items[?(@.status.checkpointId=="<checkpoint_id>")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'
+>   ```
+>
+>   或直接浏览列表找到目标 CR：`kubectl get checkpoints -n <命名空间>`。适用于升级输出已丢失、或命名空间内 Checkpoint 较多需精确定位的场景
 
 ### 4.3 执行示例
 
@@ -255,6 +292,12 @@ E2B_API_KEY=sk-staging-abc123def456 \
   --checkpoint cp-bp100987kj45vjtbrs0c \
   -n default \
   --shutdown-time 2026-07-25T10:00:00Z
+
+# 示例 4：按 namespace/name 直接定位 Checkpoint CR（无需 checkpoint ID）
+E2B_DOMAIN=e2b-staging.example.com \
+E2B_API_KEY=sk-staging-abc123def456 \
+/opt/venv/bin/python3 restore_from_cp.py \
+  --checkpoint-cr default/cp-bp100987kj45vjtbrs0c-x7k2m
 ```
 
 ### 4.4 预期输出
@@ -283,7 +326,7 @@ E2B_API_KEY=sk-staging-abc123def456 \
 
 ### 4.5 脚本流程
 
-1. **Step 1**: 通过 Kubernetes API 查询 Checkpoint CR，根据 `status.checkpointId` 匹配，获取 `spec.podName` 作为沙箱名称
+1. **Step 1**: 通过 Kubernetes API 查询 Checkpoint CR：指定 `--checkpoint-cr` 时直接按 namespace/name 获取；否则在命名空间内遍历按 `status.checkpointId` 匹配。获取 `spec.podName` 作为沙箱名称
 2. **Step 2**: 通过 E2B SDK `get_info()` 检查沙箱是否已存在
    - 若沙箱处于 Running/Paused 状态：直接退出（无需恢复）
    - 若沙箱处于 dead 等不可读状态：报错退出（需手动清理）
@@ -294,13 +337,94 @@ E2B_API_KEY=sk-staging-abc123def456 \
 
 | 失败步骤 | 可能原因 | 处理方式 |
 |----------|----------|----------|
-| [1] Lookup Checkpoint | Checkpoint CR 不存在或 Kubernetes API 调用失败 | 确认 checkpoint ID 和命名空间；检查 kubeconfig 路径 |
+| [1] Lookup Checkpoint | Checkpoint CR 不存在或 Kubernetes API 调用失败 | 确认 checkpoint ID（或 `--checkpoint-cr` 的 namespace/name）；检查 kubeconfig 路径 |
 | [2] Check Sandbox | 沙箱处于 dead 状态 | 手动 `kubectl delete sbx <name> -n <ns>` 后重试 |
 | [3] Clone | 409（旧 CR 未清理完）或 504（ALB 超时） | 脚本已内置重试；若仍失败，等待 1 分钟后重跑 |
 
 ---
 
-## 五、注意事项
+## 五、批量升级
+
+使用 `batch_upgrade_sts.py` 批量升级多个沙箱。脚本在进程内直接调用 `upgrade_sts.py` 的 `main()` 函数（不另起 Python 进程），支持并发执行、失败阈值熔断和 SIGTERM 中断。
+
+### 5.1 命令格式
+
+```bash
+E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 batch_upgrade_sts.py \
+  -f <沙箱列表文件> \
+  [-p <并发度>] \
+  [-m <最大失败数>] \
+  --pv-map <新老PV映射> \
+  --default-cred <CredentialProvider名> \
+  --agent-name <Agent应用名> \
+  [--kubeconfig <kubeconfig路径>] \
+  [--timeout <超时秒数>] \
+  [--gc-checkpoint] \
+  [--status-file <状态文件>] \
+  [--log-file <日志文件>]
+```
+
+| 参数 | 必传 | 默认值 | 说明 |
+|------|------|--------|------|
+| `-f`, `--file` | 是 | - | 沙箱列表文件，每行一个 `namespace/name`；空行和 `#` 开头的注释行跳过；格式错误的行记录为 FAILED 但不中断批量 |
+| `-p`, `--parallelism` | 否 | `1` | 任意时刻并发执行的升级沙箱数量 |
+| `-m`, `--max-failure` | 否 | 无限制 | FAILED 数超过阈值后中断整体升级：不再启动新升级（未启动的记为 ABORTED），已在升级中的正常完成；SKIPPED 不计入 |
+| `--pv-map` / `--default-cred` / `--agent-name` / `--kubeconfig` / `--timeout` / `--gc-checkpoint` | 同单个升级 | 同单个升级 | 含义与 `upgrade_sts.py` 完全一致，透传给每个沙箱的升级 |
+| `--status-file` | 否 | `upgrade_status_<时间戳>.txt` | 状态文件，每个沙箱一行简要结果 |
+| `--log-file` | 否 | `upgrade_log_<时间戳>.log` | 详细日志文件，每个沙箱的完整输出连续输出为一个块，不会交错 |
+
+### 5.2 沙箱列表文件示例
+
+```
+# 生产集群待升级沙箱
+default/code-interpreter-prod-x7k2m
+default/code-interpreter-prod-a1b2c
+sandbox-ns/openclaw-sbx-01
+```
+
+### 5.3 执行示例
+
+```bash
+E2B_DOMAIN=e2b-staging.example.com \
+E2B_API_KEY=sk-staging-abc123def456 \
+/opt/venv/bin/python3 batch_upgrade_sts.py \
+  -f sandbox_list.txt \
+  -p 4 \
+  -m 5 \
+  --pv-map oss-aksk-pv-1:oss-sts-pv-1 \
+  --default-cred oss-rw:oss-ro \
+  --agent-name openclaw
+```
+
+### 5.4 状态文件格式
+
+每个沙箱完成时写入一行，结尾附汇总行：
+
+```
+default/code-interpreter-prod-x7k2m  SUCCESS
+default/code-interpreter-prod-a1b2c  SKIPPED  Sandbox default/code-interpreter-prod-a1b2c already upgraded, skipping
+sandbox-ns/openclaw-sbx-01  FAILED  Failed to create snapshot: ...
+ns/unstarted-sbx  ABORTED  batch aborted after 6 failures
+ns/inflight-sbx  INTERRUPTED  received SIGTERM
+# total=5 success=1 skipped=1 failed=1 aborted=1 interrupted=1
+```
+
+| 状态 | 含义 |
+|------|------|
+| SUCCESS | 升级成功 |
+| SKIPPED | 前置检查跳过（已升级、非 E2B 创建、无 CSI 配置等） |
+| FAILED | 升级失败，附错误信息 |
+| ABORTED | 因 `-m` 阈值熔断或收到信号，未启动升级 |
+| INTERRUPTED | 收到 SIGTERM/SIGINT，升级被立即中断 |
+
+### 5.5 信号处理与退出码
+
+- 收到 **SIGTERM/SIGINT** 后：不再启动新升级；对升级中的沙箱立即中断并记为 INTERRUPTED（已产生的部分输出仍写入日志文件）；被中断的沙箱可能停留在升级中间态（如已建 snapshot 未 clone），需结合日志人工确认或用 `restore_from_cp.py` 恢复
+- 退出码：`0` 全部成功/跳过；`1` 存在 FAILED；`2` 因 `-m` 熔断；`130` 收到 SIGTERM/SIGINT
+
+---
+
+## 六、注意事项
 
 1. **sandbox 升级后标签会变**：快照重建后 `sandbox-template` 标签会带 hash 后缀，`sandbox-pool` 标签可能丢失。
 
@@ -320,5 +444,11 @@ E2B_API_KEY=sk-staging-abc123def456 \
 
 7. **中途 Checkpoint 清理**：升级流程最后一步（Step 8），仅在指定 `--gc-checkpoint` 时执行，通过 E2B SDK `Sandbox.delete_snapshot()` 删除快照产生的 Checkpoint。默认不删除，保留 checkpoint 以备后续通过 `restore_from_cp.py` 手动恢复。
 
-8. **DNS 策略检查**：创建快照前（Step 3），脚本检查 Sandbox CR 的 `dnsPolicy`，若非 `ClusterFirst` 则自动通过 Kubernetes API patch 修正。该操作不等待 Pod 生效，直接继续后续步骤。
+8. **Spec 检查与修正**：创建快照前（Step 3），脚本检查并一次性 patch 修正 Sandbox CR 的以下内容（不等待 Pod 生效，直接继续后续步骤）：
+   - `dnsPolicy` 非 `ClusterFirst` 时修正为 `ClusterFirst`，并清除 `upgradePolicy`
+   - `spec.runtimes` 中补齐 `csi` 和 `agent-runtime`（保留 `traffic-proxy` 等已有配置）
+   - 移除遗留 initContainers：`init`、`csi-sidecar`、`csi-agent-sidecar`（改由 runtimes 机制注入）
+   - 移除遗留 volumes 及容器中对应的 volumeMounts：`envd-volume`、`fuse-device`、`mount-root`、`nas-plugin-dir`、`oss-plugin-dir`、`run-cnfs`、`efc-metrics-dir`、`ossfs-metrics-dir`、`csi-agent-config`、`token-volume`
+   - 移除非 init 容器中执行 `/mnt/envd/envd-run.sh` 的 postStart hook
+   - 移除非 init 容器中的 `ENVD_DIR`、`POD_UID`、`GODEBUG` 环境变量
 
