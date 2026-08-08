@@ -352,51 +352,72 @@ E2B_API_KEY=sk-staging-abc123def456 \
 ```bash
 E2B_DOMAIN=<域名> E2B_API_KEY=<密钥> python3 batch_upgrade_sts.py \
   -f <沙箱列表文件> \
+  [-c <配置文件>] \
   [-p <并发度>] \
-  [-m <最大失败数>] \
-  --pv-map <新老PV映射> \
-  --default-cred <CredentialProvider名> \
-  --agent-name <Agent应用名> \
-  [--kubeconfig <kubeconfig路径>] \
-  [--timeout <超时秒数>] \
-  [--gc-checkpoint] \
-  [--status-file <状态文件>] \
-  [--log-file <日志文件>]
+  [-m <最大失败数>]
 ```
 
 | 参数 | 必传 | 默认值 | 说明 |
 |------|------|--------|------|
-| `-f`, `--file` | 是 | - | 沙箱列表文件，每行一个 `namespace/name`；空行和 `#` 开头的注释行跳过；格式错误的行记录为 FAILED 但不中断批量 |
+| `-f`, `--file` | 是 | - | 沙箱列表文件，每行一个沙箱名称（不含命名空间前缀）；空行和 `#` 开头的注释行跳过；格式错误的行（如含 `/`）记录为 FAILED 但不中断批量；输出文件路径由该文件名派生，不可另行指定：状态文件 `<列表文件>.status`、详细日志文件 `<列表文件>.log` |
+| `-c`, `--config` | 否 | `sts.conf` | 升级配置文件，每行 `key=value`，可识别的 key：`namespace`（作为 `-n` 传给 upgrade_sts.main，必填）、`pv-map`（`--pv-map`）、`default-cred`（`--default-cred`）、`agent-name`（`--agent-name`）、`kubeconfig`（`--kubeconfig`）、`timeout`（`--timeout`，整数）、`gc-checkpoint`（`--gc-checkpoint`，`true`/`false`）；仅 `namespace` 为必填，其余 key 省略时以空值透传给 upgrade_sts.main（若其内部依赖该值，对应沙箱会逐个失败）；所有升级设置均由该文件提供，脚本无对应 CLI 选项；文件不存在时报错退出 |
 | `-p`, `--parallelism` | 否 | `1` | 任意时刻并发执行的升级沙箱数量 |
 | `-m`, `--max-failure` | 否 | 无限制 | FAILED 数超过阈值后中断整体升级：不再启动新升级（未启动的记为 ABORTED），已在升级中的正常完成；SKIPPED 不计入 |
-| `--pv-map` / `--default-cred` / `--agent-name` / `--kubeconfig` / `--timeout` / `--gc-checkpoint` | 同单个升级 | 同单个升级 | 含义与 `upgrade_sts.py` 完全一致，透传给每个沙箱的升级 |
-| `--status-file` | 否 | `upgrade_status_<时间戳>.txt` | 状态文件，每个沙箱一行简要结果 |
-| `--log-file` | 否 | `upgrade_log_<时间戳>.log` | 详细日志文件，每个沙箱的完整输出连续输出为一个块，不会交错 |
 
-### 5.2 沙箱列表文件示例
+输出文件说明：
+
+- **状态文件** `<列表文件>.status`：每个沙箱一行简要结果
+- **详细日志文件** `<列表文件>.log`：每个沙箱的完整输出（stdout 与 stderr，stderr 以 `--- stderr ---` 标记分隔）连续输出为一个块，不会交错；每个块内记录该沙箱升级操作的 `[start]` 开始时间、`[end]` 结束时间及耗时；worker 的 stderr 不会打印到控制台。例如 `-f sandbox_list.txt` 对应 `sandbox_list.txt.status` 和 `sandbox_list.txt.log`；两个文件均为追加模式，重复执行同一列表文件时结果累积
+
+配置文件 `sts.conf` 示例：
+
+```
+# 升级配置
+namespace=default
+pv-map=oss-aksk-pv-1:oss-sts-pv-1
+default-cred=oss-rw:oss-ro
+agent-name=openclaw
+kubeconfig=/path/to/kubeconfig
+timeout=3600
+gc-checkpoint=false
+```
+
+### 5.2 执行前预校验
+
+批量升级开始前，脚本会用配置文件中的 `kubeconfig`（未配置时用默认 kubeconfig）对升级配置做集群侧预校验，任一项不通过即报错退出（退出码 `1`），不启动任何升级：
+
+| 校验项 | 校验内容 |
+|--------|----------|
+| `pv-map` | 每个目的 PV 存在，且 `spec.volumeAttributes.authType`（或 `spec.csi.volumeAttributes.authType`）为 `agent-identity` |
+| `default-cred` | 每个 CredentialProvider（rw 与 ro）存在，且 `spec.type` 为 `RAM` |
+| `agent-name` | 对应的 AgentIdentity 存在 |
+
+CredentialProvider / AgentIdentity 属于 `agentidentity.alibabacloud.com/v1alpha1`，脚本通过 API discovery 定位其 group（优先 `agentidentity.alibabacloud.com`，discovery 时自动跳过无响应的坏 group），无需硬编码。配置文件中未设置的 key 跳过对应校验。
+
+### 5.3 沙箱列表文件示例
+
+每行一个沙箱名称（命名空间统一由配置文件的 `namespace` 决定）：
 
 ```
 # 生产集群待升级沙箱
-default/code-interpreter-prod-x7k2m
-default/code-interpreter-prod-a1b2c
-sandbox-ns/openclaw-sbx-01
+code-interpreter-prod-x7k2m
+code-interpreter-prod-a1b2c
+openclaw-sbx-01
 ```
 
-### 5.3 执行示例
+### 5.4 执行示例
 
 ```bash
 E2B_DOMAIN=e2b-staging.example.com \
 E2B_API_KEY=sk-staging-abc123def456 \
 /opt/venv/bin/python3 batch_upgrade_sts.py \
   -f sandbox_list.txt \
+  -c sts.conf \
   -p 4 \
-  -m 5 \
-  --pv-map oss-aksk-pv-1:oss-sts-pv-1 \
-  --default-cred oss-rw:oss-ro \
-  --agent-name openclaw
+  -m 5
 ```
 
-### 5.4 状态文件格式
+### 5.5 状态文件格式
 
 每个沙箱完成时写入一行，结尾附汇总行：
 
@@ -451,4 +472,3 @@ ns/inflight-sbx  INTERRUPTED  received SIGTERM
    - 移除遗留 volumes 及容器中对应的 volumeMounts：`envd-volume`、`fuse-device`、`mount-root`、`nas-plugin-dir`、`oss-plugin-dir`、`run-cnfs`、`efc-metrics-dir`、`ossfs-metrics-dir`、`csi-agent-config`、`token-volume`
    - 移除非 init 容器中执行 `/mnt/envd/envd-run.sh` 的 postStart hook
    - 移除非 init 容器中的 `ENVD_DIR`、`POD_UID`、`GODEBUG` 环境变量
-
